@@ -1,0 +1,18 @@
+[Unit]
+Description=Sentinel System Monitor Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sentinel --service
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Optional: Run as specific user
+# User=sentinel
+# Group=sentinel
+
+[Install]
+WantedBy=multi-user.target
