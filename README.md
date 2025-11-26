@@ -37,6 +37,8 @@ sentinel
 - **Proxy traffic monitoring** - Shows nginx/caddy requests per second
 - **Wider graphs** - 100 data points for full-width terminal graphs
 - **Performance optimized** - Fast startup on low-power devices
+- **Enhanced network panel** - Connection quality meter, VPN handshake age, proper link speed
+- **Docker volumes with sizes** - Shows actual volume names and storage used
 
 ### Themes
 5 built-in color themes (press `t` to cycle):
@@ -62,10 +64,12 @@ Use `--theme <name>` or press `t` in the TUI to switch.
 ### Network
 - Local IP detection
 - Public IP detection (cached, non-blocking)
-- WireGuard VPN status with peer count
-- Real-time traffic graphs
+- WireGuard VPN status with peer count and handshake age
+- Real-time traffic graphs with speed indicators
 - Total RX/TX statistics
 - Reverse proxy traffic (nginx/caddy)
+- Connection quality signal meter
+- Link speed display (Mbps/Gbps)
 
 ## Installation
 
@@ -178,6 +182,11 @@ journalctl -u sentinel -f
 - Wider graphs (100 data points)
 - Docker volumes with names and sizes
 - Performance optimized for low-power devices
+- Enhanced network panel:
+  - Connection quality signal meter (5-bar indicator)
+  - VPN peer handshake age display
+  - Fixed link speed (hides invalid -1 values, shows Gbps)
+  - Full VPN peer IPs (no more truncation)
 
 ### v0.3.0
 - Docker container and volume monitoring

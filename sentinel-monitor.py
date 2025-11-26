@@ -7,8 +7,10 @@ Features:
 - Single-screen adaptive layout (fits any terminal size)
 - Multiple layout modes: default, cpu, network, docker, minimal (press L)
 - Dynamic Docker/K8s container lists (auto-adjusts to available space)
+- Docker volumes with actual names and sizes
 - Energy consumption monitoring (RAPL for desktops, battery for laptops)
 - Reverse proxy traffic monitoring (nginx/caddy access logs)
+- Enhanced network panel with signal meter, VPN handshake age, link speed
 - Performance optimized (direct /proc and /sys reads, minimal subprocesses)
 - Enhanced visuals with braille sparklines and gradient colors
 - Adjustable refresh rate (1-10 seconds, press +/-)
@@ -585,15 +587,24 @@ class SentinelMonitor:
             return volumes
         
         try:
-            # Get volume info with sizes using docker system df
-            output = self.run_cmd("docker system df -v --format '{{.Name}}|{{.Size}}' 2>/dev/null | head -10")
+            # Get volume sizes using docker system df -v (volumes section)
+            output = self.run_cmd("docker system df -v 2>/dev/null")
             if output and "permission denied" not in output.lower():
+                in_volumes = False
                 for line in output.strip().split('\n'):
-                    if '|' in line:
-                        parts = line.split('|')
+                    # Look for VOLUME NAME header
+                    if 'VOLUME NAME' in line:
+                        in_volumes = True
+                        continue
+                    # Stop at next section (empty line or new header)
+                    if in_volumes:
+                        if not line.strip() or line.startswith('REPOSITORY') or line.startswith('CONTAINER'):
+                            break
+                        parts = line.split()
                         if len(parts) >= 2:
-                            name = parts[0][:12]
-                            size = parts[1].strip()
+                            name = parts[0][:14]
+                            # Size is typically the 3rd column (after LINKS)
+                            size = parts[-1] if len(parts) >= 3 else '—'
                             volumes.append({
                                 'mount': name,
                                 'used': size,
@@ -604,16 +615,21 @@ class SentinelMonitor:
                 if volumes:
                     return volumes[:5]  # Limit to 5 volumes
             
-            # Fallback: simple volume count
-            output = self.run_cmd("docker volume ls -q 2>/dev/null")
+            # Fallback: get volume names and try to get sizes individually
+            output = self.run_cmd("docker volume ls --format '{{.Name}}' 2>/dev/null")
             if not output or "permission denied" in output.lower():
                 return volumes
             
             vol_names = output.strip().split('\n') if output.strip() else []
             for name in vol_names[:5]:
+                if not name:
+                    continue
+                # Try to get size via inspect
+                size_out = self.run_cmd(f"docker system df -v 2>/dev/null | grep -E '^{name[:20]}' | awk '{{print $NF}}'")
+                size = size_out.strip() if size_out and size_out.strip() else '—'
                 volumes.append({
-                    'mount': name[:12],
-                    'used': '—',
+                    'mount': name[:14],
+                    'used': size,
                     'total': '',
                     'percent': 0,
                     'type': 'docker'
@@ -796,6 +812,17 @@ class SentinelMonitor:
 
             handshake_age = (now - handshake) if handshake else None
             connected = handshake_age is not None and handshake_age < 180
+            
+            # Format handshake age as latency indicator
+            if handshake_age is not None:
+                if handshake_age < 60:
+                    latency = f"{int(handshake_age)}s"
+                elif handshake_age < 3600:
+                    latency = f"{int(handshake_age // 60)}m"
+                else:
+                    latency = f"{int(handshake_age // 3600)}h"
+            else:
+                latency = ""
 
             connections.append({
                 'interface': iface,
@@ -806,7 +833,8 @@ class SentinelMonitor:
                 'rx': rx,
                 'tx': tx,
                 'keepalive': keepalive,
-                'port': iface_ports.get(iface)
+                'port': iface_ports.get(iface),
+                'latency': latency
             })
         return connections
 
@@ -1579,18 +1607,46 @@ class SentinelMonitor:
 
                 # === LAYOUT CALCULATION ===
                 # 3-column for wide (>=100), 2-column for medium (>=60), stacked for narrow
+                # Layout mode affects column widths
                 row = 1
                 available_h = h - 2  # header + footer
                 
+                # Layout-specific width ratios
+                layout = self.layout_mode
                 if w >= 100:
-                    # 3 columns side by side
-                    col1_w = w // 3
-                    col2_w = w // 3
-                    col3_w = w - col1_w - col2_w
+                    if layout == 'cpu':
+                        # CPU emphasized: 50% | 25% | 25%
+                        col1_w = w // 2
+                        col2_w = w // 4
+                        col3_w = w - col1_w - col2_w
+                    elif layout == 'network':
+                        # Network emphasized: 25% | 25% | 50%
+                        col1_w = w // 4
+                        col2_w = w // 4
+                        col3_w = w - col1_w - col2_w
+                    elif layout == 'docker':
+                        # Docker emphasized: 30% | 20% | 50% (power box gets more for containers)
+                        col1_w = int(w * 0.30)
+                        col2_w = int(w * 0.20)
+                        col3_w = w - col1_w - col2_w
+                    elif layout == 'minimal':
+                        # Minimal: equal small columns
+                        col1_w = w // 3
+                        col2_w = w // 3
+                        col3_w = w - col1_w - col2_w
+                    else:  # default
+                        col1_w = w // 3
+                        col2_w = w // 3
+                        col3_w = w - col1_w - col2_w
                     top_h = available_h
                 elif w >= 60:
                     # 2 columns side by side
-                    col1_w = w // 2
+                    if layout == 'cpu':
+                        col1_w = int(w * 0.6)
+                    elif layout == 'network' or layout == 'docker':
+                        col1_w = int(w * 0.4)
+                    else:
+                        col1_w = w // 2
                     col2_w = w - col1_w
                     col3_w = col2_w  # reuse for bottom
                     top_h = available_h
@@ -1732,8 +1788,16 @@ class SentinelMonitor:
                 if w >= 100:
                     # 3-col: column 3 is rightmost
                     col3_x = col1_w + col2_w
-                    net_box_h = top_h // 2
-                    pwr_box_h = top_h - net_box_h
+                    # Adjust heights based on layout mode
+                    if layout == 'network':
+                        net_box_h = int(top_h * 0.7)  # Network gets 70%
+                        pwr_box_h = top_h - net_box_h
+                    elif layout == 'docker':
+                        net_box_h = int(top_h * 0.3)  # Network smaller
+                        pwr_box_h = top_h - net_box_h  # Power/Docker gets more
+                    else:
+                        net_box_h = top_h // 2
+                        pwr_box_h = top_h - net_box_h
                     col3_actual_w = col3_w
                     col3_row = row
                 elif w >= 60:
@@ -1764,11 +1828,14 @@ class SentinelMonitor:
                         if conn_type:
                             stdscr.addstr(ny + line, nx + len(iface) + 1, f"({conn_type})", curses.color_pair(8))
                         
-                        # Link speed on right
+                        # Link speed on right (only show if valid positive value)
                         link_speed = net.get('link_speed')
-                        if link_speed and nw > 20:
-                            speed_text = f"{link_speed}Mbps"
-                            stdscr.addstr(ny + line, nx + nw - len(speed_text), speed_text, curses.color_pair(8))
+                        if link_speed and link_speed > 0 and nw > 20:
+                            if link_speed >= 1000:
+                                speed_text = f"{link_speed // 1000}Gbps"
+                            else:
+                                speed_text = f"{link_speed}Mbps"
+                            stdscr.addstr(ny + line, nx + nw - len(speed_text), speed_text, curses.color_pair(2))
                         line += 1
                         
                         # IPs
@@ -1828,10 +1895,19 @@ class SentinelMonitor:
                         for peer in vpn_list[:nh - line]:
                             if line >= nh:
                                 break
-                            endpoint = peer['endpoint'].split(':')[0][:12]
+                            # Get full IP (without port), limit to available width
+                            endpoint_full = peer['endpoint'].split(':')[0] if peer.get('endpoint') else "—"
+                            max_ip_len = nw - 4  # Leave room for status icon
+                            endpoint = endpoint_full[:max_ip_len]
                             status = "●" if peer['connected'] else "○"
                             color = curses.color_pair(2) if peer['connected'] else curses.color_pair(4)
-                            stdscr.addstr(ny + line, nx, f"  {status} {endpoint}", color)
+                            # Show latency if available
+                            latency = peer.get('latency', '')
+                            if latency and len(endpoint) + len(latency) + 5 < nw:
+                                stdscr.addstr(ny + line, nx, f"  {status} {endpoint}", color)
+                                stdscr.addstr(ny + line, nx + nw - len(latency) - 1, latency, curses.color_pair(8))
+                            else:
+                                stdscr.addstr(ny + line, nx, f"  {status} {endpoint}", color)
                             line += 1
                         
                         # Proxy traffic stats if available
@@ -1842,6 +1918,30 @@ class SentinelMonitor:
                             stdscr.addstr(ny + line, nx, f"proxy:", curses.color_pair(8))
                             stdscr.addstr(ny + line, nx + 7, source, curses.color_pair(5))
                             stdscr.addstr(ny + line, nx + 7 + len(source) + 1, f"{rps:.1f}rps", curses.color_pair(2))
+                            line += 1
+                        
+                        # Show connection quality indicator if space
+                        if line < nh and net.get('operstate') == 'up':
+                            # Calculate quality based on speed and stability
+                            rx_speed = net.get('rx_speed', 0)
+                            tx_speed = net.get('tx_speed', 0)
+                            if rx_speed > 1000 or tx_speed > 1000:
+                                quality = "▰▰▰▰▰"
+                                q_color = curses.color_pair(2)
+                            elif rx_speed > 100 or tx_speed > 100:
+                                quality = "▰▰▰▰▱"
+                                q_color = curses.color_pair(2)
+                            elif rx_speed > 10 or tx_speed > 10:
+                                quality = "▰▰▰▱▱"
+                                q_color = curses.color_pair(3)
+                            elif rx_speed > 0 or tx_speed > 0:
+                                quality = "▰▰▱▱▱"
+                                q_color = curses.color_pair(3)
+                            else:
+                                quality = "▰▱▱▱▱"
+                                q_color = curses.color_pair(4)
+                            stdscr.addstr(ny + line, nx, "signal:", curses.color_pair(8))
+                            stdscr.addstr(ny + line, nx + 8, quality, q_color)
                             line += 1
                     
                     # Power/Energy box - improved layout
