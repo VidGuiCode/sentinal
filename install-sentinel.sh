@@ -1,10 +1,10 @@
 #!/bin/bash
-# Sentinel v0.3 - Universal Linux System Monitor
+# Sentinel v0.4 - Universal Linux System Monitor
 # Multi-distro Installation Script
 
 set -e
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 # Colors
 RED='\033[0;31m'
@@ -135,15 +135,18 @@ echo "  sentinel      - Launch Sentinel monitor"
 echo "  sen           - Short alias"
 echo ""
 echo -e "${CYAN}Controls:${NC}"
-echo "  q - Quit    r - Refresh    t - Theme    i - Check IP"
+echo "  q - Quit       r - Refresh    t - Theme"
+echo "  l - Layout     h - Help       i - Check IP"
+echo "  +/- Adjust refresh rate (1-10s)"
 echo ""
-echo -e "${CYAN}v0.3 Features:${NC}"
-echo "  - Docker container and volume monitoring"
-echo "  - Kubernetes pod/node monitoring"
-echo "  - 5 color themes (press t to cycle)"
-echo "  - Config file support (~/.config/sentinel/config.json)"
-echo "  - Systemd service mode (--service)"
-echo "  - Per-core CPU bars"
+echo -e "${CYAN}v0.4 Features:${NC}"
+echo "  - Loading modal & help overlay (press h)"
+echo "  - Adjustable refresh rate (+/- keys)"
+echo "  - Layout modes: default, cpu, network, docker, minimal"
+echo "  - Dynamic Docker/K8s container lists"
+echo "  - Reverse proxy traffic (nginx/caddy)"
+echo "  - Improved temperature detection (ARM, VMs)"
+echo "  - Performance optimized for low-power devices"
 echo ""
 echo -e "${CYAN}Options:${NC}"
 echo "  sentinel --theme nord    Use Nord theme"

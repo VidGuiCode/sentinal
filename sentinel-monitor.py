@@ -1,15 +1,28 @@
 #!/usr/bin/env python3
 """
-Sentinel v0.3 - Universal Linux System Monitor
+Sentinel v0.4 - Universal Linux System Monitor
 A beautiful, real-time single-screen TUI dashboard for homelab monitoring
 
 Features:
 - Single-screen adaptive layout (fits any terminal size)
+- Multiple layout modes: default, cpu, network, docker, minimal (press L)
+- Dynamic Docker/K8s container lists (auto-adjusts to available space)
 - Energy consumption monitoring (RAPL for desktops, battery for laptops)
+- Reverse proxy traffic monitoring (nginx/caddy access logs)
 - Performance optimized (direct /proc and /sys reads, minimal subprocesses)
 - Enhanced visuals with braille sparklines and gradient colors
+- Adjustable refresh rate (1-10 seconds, press +/-)
 - Config file support with custom themes and alert thresholds
 - Systemd service mode for headless logging
+
+Controls:
+- q: Quit
+- r: Refresh data now
+- t: Cycle themes (default, nord, dracula, gruvbox, monokai)
+- l: Cycle layouts (default, cpu, network, docker, minimal)
+- h: Toggle help overlay
+- i: Refresh public IP
+- +/-: Adjust refresh rate (faster/slower)
 
 GitHub: https://github.com/VidGuiCode/sentinel
 License: MIT
@@ -28,11 +41,15 @@ from datetime import datetime, timedelta
 from collections import deque
 from pathlib import Path
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
+
+# Layout modes
+LAYOUT_MODES = ['default', 'cpu', 'network', 'docker', 'minimal']
 
 # Default configuration
 DEFAULT_CONFIG = {
     'theme': 'default',
+    'layout': 'default',
     'refresh_rate': 2,
     'alerts': {
         'cpu_high': 85,
@@ -48,6 +65,10 @@ DEFAULT_CONFIG = {
     'show_vpn': True,
     'public_ip_check': True,
     'log_file': '/var/log/sentinel.log',
+    'proxy_logs': {
+        'nginx': '/var/log/nginx/access.log',
+        'caddy': '/var/log/caddy/access.log',
+    },
 }
 
 # Color themes
@@ -168,13 +189,13 @@ class SentinelMonitor:
         # RAPL energy tracking (for desktops/servers without battery)
         self.last_rapl = {'energy': 0, 'time': time.time()}
         self.rapl_path = self._detect_rapl_path()
-        self.power_history = deque([0] * 30, maxlen=30)
+        self.power_history = deque([0] * 100, maxlen=100)
         
-        # History for sparklines (30 points for smoother graphs)
-        self.cpu_history = deque([0] * 30, maxlen=30)
-        self.mem_history = deque([0] * 30, maxlen=30)
-        self.rx_history = deque([0] * 30, maxlen=30)
-        self.tx_history = deque([0] * 30, maxlen=30)
+        # History for sparklines (100 points to fill wide terminals)
+        self.cpu_history = deque([0] * 100, maxlen=100)
+        self.mem_history = deque([0] * 100, maxlen=100)
+        self.rx_history = deque([0] * 100, maxlen=100)
+        self.tx_history = deque([0] * 100, maxlen=100)
         
         # Cache CPU model (doesn't change)
         self.cpu_model = self._get_cpu_model()
@@ -184,6 +205,20 @@ class SentinelMonitor:
         self._docker_available = None
         self._kubectl_available = None
         self._first_render = True  # Skip expensive ops on first frame
+        self._loading = False  # Loading state for modal
+        self._show_help = False  # Help overlay toggle
+        
+        # Layout mode
+        self.layout_mode = self.config.get('layout', 'default')
+        
+        # Dynamic refresh rate (can be adjusted with +/-)
+        self.refresh_rate = self.config.get('refresh_rate', 2)
+        
+        # Proxy traffic monitoring
+        self.proxy_logs = self.config.get('proxy_logs', DEFAULT_CONFIG['proxy_logs'])
+        self.proxy_history = deque([0] * 100, maxlen=100)
+        self._last_proxy_check = 0
+        self._proxy_stats = {'requests': 0, 'bytes': 0, 'rps': 0.0}
 
     def _detect_default_interface(self):
         """Detect default network interface from routing table."""
@@ -348,6 +383,15 @@ class SentinelMonitor:
 
     def _get_cpu_temp(self):
         """Get CPU temperature from hwmon sysfs (faster than sensors)."""
+        # Try thermal zones first (works on ARM, VMs, containers)
+        thermal_zone = Path('/sys/class/thermal/thermal_zone0/temp')
+        if thermal_zone.exists():
+            try:
+                temp = int(thermal_zone.read_text().strip())
+                return temp / 1000.0
+            except:
+                pass
+        
         hwmon_base = Path('/sys/class/hwmon')
         if not hwmon_base.exists():
             return 0.0
@@ -357,14 +401,24 @@ class SentinelMonitor:
                 name_file = hwmon / 'name'
                 if name_file.exists():
                     name = name_file.read_text().strip()
-                    # Look for CPU thermal sensors
-                    if name in ('coretemp', 'k10temp', 'zenpower', 'acpitz', 'thinkpad'):
+                    # Look for CPU thermal sensors (expanded list)
+                    if name in ('coretemp', 'k10temp', 'zenpower', 'acpitz', 'thinkpad', 
+                                'cpu_thermal', 'soc_thermal', 'armada_thermal', 'rpi_thermal'):
                         # Try temp1_input first (package temp), then others
                         for temp_file in ['temp1_input', 'temp2_input', 'temp3_input']:
                             temp_path = hwmon / temp_file
                             if temp_path.exists():
                                 temp = int(temp_path.read_text().strip())
                                 return temp / 1000.0  # Convert from millidegrees
+                
+                # Fallback: check any temp*_input in hwmon
+                for temp_file in sorted(hwmon.glob('temp*_input')):
+                    try:
+                        temp = int(temp_file.read_text().strip())
+                        if temp > 0:
+                            return temp / 1000.0
+                    except:
+                        continue
         except:
             pass
         return 0.0
@@ -531,17 +585,35 @@ class SentinelMonitor:
             return volumes
         
         try:
-            # Simple volume count
+            # Get volume info with sizes using docker system df
+            output = self.run_cmd("docker system df -v --format '{{.Name}}|{{.Size}}' 2>/dev/null | head -10")
+            if output and "permission denied" not in output.lower():
+                for line in output.strip().split('\n'):
+                    if '|' in line:
+                        parts = line.split('|')
+                        if len(parts) >= 2:
+                            name = parts[0][:12]
+                            size = parts[1].strip()
+                            volumes.append({
+                                'mount': name,
+                                'used': size,
+                                'total': '',
+                                'percent': 0,
+                                'type': 'docker'
+                            })
+                if volumes:
+                    return volumes[:5]  # Limit to 5 volumes
+            
+            # Fallback: simple volume count
             output = self.run_cmd("docker volume ls -q 2>/dev/null")
             if not output or "permission denied" in output.lower():
                 return volumes
             
-            vol_count = len(output.strip().split('\n')) if output.strip() else 0
-            
-            if vol_count > 0:
+            vol_names = output.strip().split('\n') if output.strip() else []
+            for name in vol_names[:5]:
                 volumes.append({
-                    'mount': f'docker:{vol_count}',
-                    'used': f'{vol_count} volumes',
+                    'mount': name[:12],
+                    'used': '—',
                     'total': '',
                     'percent': 0,
                     'type': 'docker'
@@ -999,6 +1071,127 @@ class SentinelMonitor:
         except:
             return 0, 0, 0
 
+    def get_proxy_stats(self):
+        """Get reverse proxy traffic stats from nginx/caddy access logs."""
+        current_time = time.time()
+        
+        # Only check every 5 seconds
+        if current_time - self._last_proxy_check < 5:
+            return self._proxy_stats
+        
+        self._last_proxy_check = current_time
+        stats = {'requests': 0, 'bytes': 0, 'rps': 0.0, 'source': None}
+        
+        # Try nginx first, then caddy
+        for proxy_name, log_path in self.proxy_logs.items():
+            if not os.path.exists(log_path):
+                continue
+            
+            try:
+                # Get last 100 lines and count requests in last minute
+                output = self.run_cmd(f"tail -100 {log_path} 2>/dev/null")
+                if not output:
+                    continue
+                
+                lines = output.strip().split('\n')
+                now = time.time()
+                recent_count = 0
+                total_bytes = 0
+                
+                for line in lines:
+                    # Parse common log format or JSON
+                    try:
+                        # Try to extract bytes (common log format: ... 200 1234)
+                        parts = line.split()
+                        if len(parts) >= 10:
+                            # Bytes is usually the 10th field in common log format
+                            bytes_str = parts[9] if parts[9].isdigit() else parts[-1]
+                            if bytes_str.isdigit():
+                                total_bytes += int(bytes_str)
+                        recent_count += 1
+                    except:
+                        recent_count += 1
+                
+                if recent_count > 0:
+                    stats['requests'] = recent_count
+                    stats['bytes'] = total_bytes
+                    stats['rps'] = recent_count / 60.0  # Approximate RPS
+                    stats['source'] = proxy_name
+                    break
+                    
+            except:
+                pass
+        
+        self._proxy_stats = stats
+        self.proxy_history.append(stats.get('rps', 0) * 10)  # Scale for visibility
+        return stats
+
+    def draw_loading_modal(self, stdscr, h, w, message="Loading..."):
+        """Draw a centered loading modal overlay."""
+        modal_w = max(len(message) + 6, 24)
+        modal_h = 5
+        
+        start_y = (h - modal_h) // 2
+        start_x = (w - modal_w) // 2
+        
+        try:
+            # Draw modal box
+            border = curses.color_pair(1)
+            fill = curses.color_pair(8)
+            
+            # Top border
+            stdscr.addstr(start_y, start_x, "╭" + "─" * (modal_w - 2) + "╮", border)
+            
+            # Middle rows
+            for i in range(1, modal_h - 1):
+                stdscr.addstr(start_y + i, start_x, "│", border)
+                stdscr.addstr(start_y + i, start_x + 1, " " * (modal_w - 2), fill)
+                stdscr.addstr(start_y + i, start_x + modal_w - 1, "│", border)
+            
+            # Bottom border
+            stdscr.addstr(start_y + modal_h - 1, start_x, "╰" + "─" * (modal_w - 2) + "╯", border)
+            
+            # Loading spinner animation
+            spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            spin_char = spinner[int(time.time() * 10) % len(spinner)]
+            
+            # Message
+            msg_x = start_x + (modal_w - len(message) - 2) // 2
+            stdscr.addstr(start_y + 2, msg_x, f"{spin_char} {message}", curses.color_pair(7) | curses.A_BOLD)
+            
+        except curses.error:
+            pass
+
+    def draw_help_modal(self, stdscr, h, w):
+        """Draw help overlay with keybindings."""
+        help_lines = [
+            "╭─────────── HELP ───────────╮",
+            "│                            │",
+            "│  q      Quit               │",
+            "│  r      Refresh now        │",
+            "│  t      Cycle themes       │",
+            "│  l      Cycle layouts      │",
+            "│  i      Refresh public IP  │",
+            "│  h      Toggle this help   │",
+            "│  +/-    Adjust refresh     │",
+            "│                            │",
+            "│  Layouts: default, cpu,    │",
+            "│    network, docker, minimal│",
+            "│                            │",
+            "╰────────────────────────────╯",
+        ]
+        
+        modal_h = len(help_lines)
+        modal_w = len(help_lines[0])
+        start_y = (h - modal_h) // 2
+        start_x = (w - modal_w) // 2
+        
+        try:
+            for i, line in enumerate(help_lines):
+                stdscr.addstr(start_y + i, start_x, line, curses.color_pair(1))
+        except curses.error:
+            pass
+
     def draw_graph(self, stdscr, y, x, width, height, data, max_val=100, title="", show_current=True):
         """Draw a btop-style filled area graph."""
         if width <= 2 or height <= 1:
@@ -1249,7 +1442,7 @@ class SentinelMonitor:
         """Update all system data."""
         current_time = time.time()
 
-        if current_time - self.last_update < 2:
+        if current_time - self.last_update < self.refresh_rate:
             return self.cache
 
         # On first render, skip slow operations for instant UI
@@ -1275,6 +1468,7 @@ class SentinelMonitor:
             'energy': self.get_energy_info(),
             'docker': self.get_docker_info(skip_stats=is_first),  # Skip per-container stats on first
             'kubernetes': self.get_kubernetes_info() if not is_first else {'available': False, 'nodes': 0, 'nodes_ready': 0, 'pods_running': 0, 'pods_pending': 0, 'pods_failed': 0, 'pods': [], 'context': ''},
+            'proxy': self.get_proxy_stats() if not is_first else {'requests': 0, 'bytes': 0, 'rps': 0.0, 'source': None},
         }
 
         self.last_update = current_time
@@ -1362,6 +1556,11 @@ class SentinelMonitor:
             try:
                 h, w = stdscr.getmaxyx()
                 stdscr.erase()
+
+                # Show loading modal on first render
+                if self._first_render:
+                    self.draw_loading_modal(stdscr, h, w, "Initializing...")
+                    stdscr.refresh()
 
                 data = self.update_data()
                 cpu = data['cpu']
@@ -1511,16 +1710,18 @@ class SentinelMonitor:
                     dy, dx, dh, dw = self.draw_box(stdscr, disk_y, col2_x, disk_box_h, col2_w, "disks")
                     if dh > 0 and dw > 0:
                         for i, disk in enumerate(disks[:dh]):
-                            mount = disk['mount'][:8]
                             disk_type = disk.get('type', 'disk')
                             
                             if disk_type == 'docker':
-                                # Docker volumes - show icon and size only
-                                stdscr.addstr(dy + i, dx, mount, curses.color_pair(5))
-                                size_text = disk['used']
-                                stdscr.addstr(dy + i, dx + 10, size_text, curses.color_pair(8))
+                                # Docker volumes - show with docker prefix, name and size
+                                mount = disk['mount'][:dw - 14]
+                                size_text = disk['used'][:8] if disk['used'] else '—'
+                                stdscr.addstr(dy + i, dx, "dk:", curses.color_pair(5))
+                                stdscr.addstr(dy + i, dx + 3, mount, curses.color_pair(8))
+                                stdscr.addstr(dy + i, dx + dw - len(size_text), size_text, curses.color_pair(7))
                             else:
                                 # Regular disk - show bar and percentage
+                                mount = disk['mount'][:8]
                                 pct = disk['percent']
                                 bar_w = max(6, dw - 16)
                                 stdscr.addstr(dy + i, dx, f"{mount:>6}", curses.color_pair(8))
@@ -1632,6 +1833,16 @@ class SentinelMonitor:
                             color = curses.color_pair(2) if peer['connected'] else curses.color_pair(4)
                             stdscr.addstr(ny + line, nx, f"  {status} {endpoint}", color)
                             line += 1
+                        
+                        # Proxy traffic stats if available
+                        proxy = data.get('proxy', {})
+                        if proxy.get('source') and line < nh:
+                            rps = proxy.get('rps', 0)
+                            source = proxy['source'][:6]
+                            stdscr.addstr(ny + line, nx, f"proxy:", curses.color_pair(8))
+                            stdscr.addstr(ny + line, nx + 7, source, curses.color_pair(5))
+                            stdscr.addstr(ny + line, nx + 7 + len(source) + 1, f"{rps:.1f}rps", curses.color_pair(2))
+                            line += 1
                     
                     # Power/Energy box - improved layout
                     pwr_y = col3_row + net_box_h
@@ -1726,9 +1937,28 @@ class SentinelMonitor:
                         
                         if line < ph - 1:
                             line += 1  # spacing
+                            remaining_lines = ph - line
+                            
+                            # Calculate space for docker and k8s
+                            has_docker = docker.get('available', False)
+                            has_k8s = k8s.get('available', False)
+                            
+                            if has_docker and has_k8s:
+                                # Split space between docker and k8s
+                                docker_lines = remaining_lines // 2
+                                k8s_lines = remaining_lines - docker_lines
+                            elif has_docker:
+                                docker_lines = remaining_lines
+                                k8s_lines = 0
+                            elif has_k8s:
+                                docker_lines = 0
+                                k8s_lines = remaining_lines
+                            else:
+                                docker_lines = 0
+                                k8s_lines = 0
                             
                             # Show Docker if available
-                            if docker.get('available'):
+                            if has_docker and docker_lines > 0:
                                 running = docker['running']
                                 stopped = docker['stopped']
                                 color = curses.color_pair(2) if running > 0 else curses.color_pair(8)
@@ -1736,9 +1966,11 @@ class SentinelMonitor:
                                 stdscr.addstr(py + line, px + 2, f"{running}", color | curses.A_BOLD)
                                 stdscr.addstr(py + line, px + 2 + len(str(running)), f"/{docker['total']}", curses.color_pair(8))
                                 line += 1
+                                docker_lines -= 1
                                 
-                                # Show top containers
-                                for container in docker['containers'][:min(3, ph - line)]:
+                                # Show containers dynamically based on available space
+                                containers_to_show = min(len(docker['containers']), docker_lines)
+                                for container in docker['containers'][:containers_to_show]:
                                     if line >= ph:
                                         break
                                     name = container['name'][:pw - 8]
@@ -1748,8 +1980,8 @@ class SentinelMonitor:
                                     stdscr.addstr(py + line, px + 3, name, curses.color_pair(8))
                                     line += 1
                             
-                            # Show K8s if available (and no Docker or space left)
-                            elif k8s.get('available') and line < ph:
+                            # Show K8s if available
+                            if has_k8s and k8s_lines > 0 and line < ph:
                                 pods_ok = k8s['pods_running']
                                 pods_bad = k8s['pods_failed'] + k8s['pods_pending']
                                 color = curses.color_pair(2) if pods_bad == 0 else curses.color_pair(3)
@@ -1758,19 +1990,23 @@ class SentinelMonitor:
                                 if pods_bad > 0:
                                     stdscr.addstr(py + line, px + 2 + len(str(pods_ok)) + 1, f"!{pods_bad}", curses.color_pair(4))
                                 line += 1
+                                k8s_lines -= 1
                                 
-                                # Show problem pods
-                                for pod in k8s['pods'][:min(3, ph - line)]:
+                                # Show pods dynamically
+                                pods_to_show = min(len(k8s['pods']), k8s_lines)
+                                for pod in k8s['pods'][:pods_to_show]:
                                     if line >= ph:
                                         break
-                                    if pod['status'] != 'Running':
-                                        name = pod['name'][:pw - 4]
+                                    name = pod['name'][:pw - 4]
+                                    if pod['status'] == 'Running':
+                                        stdscr.addstr(py + line, px + 1, f"● {name}", curses.color_pair(2))
+                                    else:
                                         status_color = curses.color_pair(4) if pod['status'] in ('Failed', 'Error', 'CrashLoopBackOff') else curses.color_pair(3)
                                         stdscr.addstr(py + line, px + 1, f"! {name}", status_color)
-                                        line += 1
+                                    line += 1
                             
-                            # Fallback to processes
-                            elif line < ph:
+                            # Fallback to processes if no docker/k8s
+                            if not has_docker and not has_k8s and line < ph:
                                 stdscr.addstr(py + line, px, f"{proc['total']} tasks", curses.color_pair(7))
                                 if proc.get('top_cpu') and line + 1 < ph:
                                     line += 1
@@ -1795,13 +2031,22 @@ class SentinelMonitor:
                     stdscr.addstr(footer_y, col, "t", curses.color_pair(3) | curses.A_BOLD)
                     stdscr.addstr(footer_y, col + 1, "heme ", curses.color_pair(8))
                     col += 6
-                    stdscr.addstr(footer_y, col, "i", curses.color_pair(3) | curses.A_BOLD)
-                    stdscr.addstr(footer_y, col + 1, "p ", curses.color_pair(8))
-                    col += 3
+                    stdscr.addstr(footer_y, col, "l", curses.color_pair(3) | curses.A_BOLD)
+                    stdscr.addstr(footer_y, col + 1, "ayout ", curses.color_pair(8))
+                    col += 7
+                    stdscr.addstr(footer_y, col, "h", curses.color_pair(3) | curses.A_BOLD)
+                    stdscr.addstr(footer_y, col + 1, "elp ", curses.color_pair(8))
+                    col += 5
+                    stdscr.addstr(footer_y, col, "+/-", curses.color_pair(3) | curses.A_BOLD)
+                    col += 4
                     
-                    # Show current theme
+                    # Show current theme, layout, and refresh rate
                     theme_text = f"[{self.theme_name}]"
-                    stdscr.addstr(footer_y, col + 2, theme_text, curses.color_pair(1))
+                    stdscr.addstr(footer_y, col + 1, theme_text, curses.color_pair(1))
+                    layout_text = f"[{self.layout_mode}]"
+                    stdscr.addstr(footer_y, col + 2 + len(theme_text), layout_text, curses.color_pair(5))
+                    rate_text = f"[{self.refresh_rate}s]"
+                    stdscr.addstr(footer_y, col + 3 + len(theme_text) + len(layout_text), rate_text, curses.color_pair(2))
                     
                     # Show alerts on right side
                     if active_alerts:
@@ -1814,6 +2059,10 @@ class SentinelMonitor:
                 except curses.error:
                     pass
 
+                # Draw help overlay if active
+                if self._show_help:
+                    self.draw_help_modal(stdscr, h, w)
+
                 stdscr.refresh()
 
                 # Input handling
@@ -1825,12 +2074,24 @@ class SentinelMonitor:
                     self._first_render = False  # Don't skip data on manual refresh
                 elif key == ord('i') or key == ord('I'):
                     self._last_ip_check = 0
+                elif key == ord('h') or key == ord('H'):
+                    self._show_help = not self._show_help
                 elif key == ord('t') or key == ord('T'):
                     # Cycle through themes
                     theme_list = list(THEMES.keys())
                     current_idx = theme_list.index(self.theme_name) if self.theme_name in theme_list else 0
                     self.theme_name = theme_list[(current_idx + 1) % len(theme_list)]
                     self.setup_colors()
+                elif key == ord('l') or key == ord('L'):
+                    # Cycle through layouts
+                    current_idx = LAYOUT_MODES.index(self.layout_mode) if self.layout_mode in LAYOUT_MODES else 0
+                    self.layout_mode = LAYOUT_MODES[(current_idx + 1) % len(LAYOUT_MODES)]
+                elif key == ord('+') or key == ord('='):
+                    # Decrease refresh interval (faster)
+                    self.refresh_rate = max(1, self.refresh_rate - 1)
+                elif key == ord('-') or key == ord('_'):
+                    # Increase refresh interval (slower)
+                    self.refresh_rate = min(10, self.refresh_rate + 1)
 
             except curses.error:
                 pass
