@@ -23,11 +23,22 @@ A lightweight terminal UI (TUI) system monitor for Linux with real-time graphs, 
 - Docker container and volume monitoring
 - Kubernetes pod/node monitoring
 - Config file support (`~/.config/sentinel/config.json`)
-- 5 color themes: default, nord, dracula, gruvbox, monokai
 - Configurable alert thresholds
 - Systemd service mode for headless logging
 - Per-core CPU usage bars
-- Theme switching with `t` key
+
+### Themes
+5 built-in color themes (press `t` to cycle):
+
+| Theme | Description |
+|-------|-------------|
+| `default` | Cyan/green terminal colors |
+| `nord` | Arctic, bluish color palette |
+| `dracula` | Dark purple/pink theme |
+| `gruvbox` | Retro, warm colors |
+| `monokai` | Classic editor theme |
+
+Use `--theme <name>` or press `t` in the TUI to switch.
 
 ### Alerts
 - CPU usage warnings (configurable thresholds)
