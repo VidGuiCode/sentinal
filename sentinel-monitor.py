@@ -1195,7 +1195,7 @@ class SentinelMonitor:
         try:
             # Quick, lightweight check using curl with timeout
             # Fetches the VERSION line from the raw GitHub file
-            github_raw = "https://raw.githubusercontent.com/VidGuiCode/sentinal/main/sentinel-monitor.py"
+            github_raw = "https://raw.githubusercontent.com/VidGuiCode/sentinel/main/sentinel-monitor.py"
             cmd = f"curl -s -m 3 {github_raw} | grep -m 1 '^VERSION = ' | cut -d'\"' -f2"
             remote_version = self.run_cmd(cmd, timeout=4)
 

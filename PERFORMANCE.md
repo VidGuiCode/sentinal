@@ -21,7 +21,7 @@ Sentinel includes a smart, non-blocking update checker that:
 
 ```bash
 # Lightweight check (runs in background, non-blocking)
-curl -s -m 3 https://raw.githubusercontent.com/VidGuiCode/sentinal/main/sentinel-monitor.py \
+curl -s -m 3 https://raw.githubusercontent.com/VidGuiCode/sentinel/main/sentinel-monitor.py \
   | grep -m 1 '^VERSION = ' | cut -d'"' -f2
 ```
 
@@ -43,7 +43,7 @@ Footer: quit refresh theme layout help +/- [nord][security][2s] v0.6.0 available
 
 When update available, user can run:
 ```bash
-curl -sL https://raw.githubusercontent.com/VidGuiCode/sentinal/main/install-sentinel.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/VidGuiCode/sentinel/main/install-sentinel.sh | sudo bash
 ```
 
 The installer:

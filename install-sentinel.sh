@@ -84,7 +84,7 @@ echo -e "Detected: ${CYAN}${DISTRO}${NC}"
 
 # Detect script directory (if run locally)
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" 2>/dev/null )" 2>/dev/null && pwd )"
-GITHUB_RAW="https://raw.githubusercontent.com/VidGuiCode/sentinal/main"
+GITHUB_RAW="https://raw.githubusercontent.com/VidGuiCode/sentinel/main"
 
 # Install dependencies
 install_deps "$DISTRO"
