@@ -1,10 +1,10 @@
 #!/bin/bash
-# Sentinel v0.4 - Universal Linux System Monitor
+# Sentinel v0.5 - Universal Linux System Monitor
 # Multi-distro Installation Script
 
 set -e
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 # Colors
 RED='\033[0;31m'
@@ -139,15 +139,18 @@ echo "  q - Quit       r - Refresh    t - Theme"
 echo "  l - Layout     h - Help       i - Check IP"
 echo "  +/- Adjust refresh rate (1-10s)"
 echo ""
-echo -e "${CYAN}v0.4 Features:${NC}"
-echo "  - Loading modal & help overlay (press h)"
-echo "  - Adjustable refresh rate (+/- keys)"
-echo "  - Layout modes: default, cpu, network, docker, minimal"
-echo "  - Dynamic Docker/K8s container lists"
-echo "  - Reverse proxy traffic (nginx/caddy)"
-echo "  - Enhanced network: signal meter, VPN handshake age"
-echo "  - Docker volumes with actual sizes"
-echo "  - Performance optimized for low-power devices"
+echo -e "${CYAN}v0.5 New Features:${NC}"
+echo "  - Security log monitoring (auth.log, syslog, secure)"
+echo "  - Failed login tracking with IP analysis"
+echo "  - Brute force detection (>20 attempts/5min)"
+echo "  - Security layout mode - press l to cycle"
+echo "  - Auto update checker (non-intrusive)"
+echo "  - Performance optimized for low-end servers"
+echo ""
+echo -e "${CYAN}Previous Features:${NC}"
+echo "  - 6 layout modes: default, cpu, network, docker, security, minimal"
+echo "  - Docker/K8s monitoring, proxy traffic stats"
+echo "  - Adjustable refresh rate, 5 color themes"
 echo ""
 echo -e "${CYAN}Options:${NC}"
 echo "  sentinel --theme nord    Use Nord theme"

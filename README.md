@@ -1,11 +1,11 @@
-# Sentinel v0.4 - Universal Linux System Monitor
+# Sentinel v0.5 - Universal Linux System Monitor
 
-A lightweight terminal UI (TUI) system monitor for Linux with real-time graphs, container monitoring, and infrastructure-focused design. Inspired by btop. Optimized for low-power devices.
+A lightweight terminal UI (TUI) system monitor for Linux with real-time graphs, container monitoring, security log analysis, and infrastructure-focused design. Inspired by btop. Optimized for low-power devices.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.6+-green.svg)
 ![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-0.4.0-cyan.svg)
+![Version](https://img.shields.io/badge/version-0.5.0-cyan.svg)
 
 ## Quick start
 
@@ -26,12 +26,22 @@ sentinel
 - **Kubernetes** - Pod status, node health, failed/pending alerts
 - **Processes** - Task count, top CPU/memory consumers
 - **Proxy** - Nginx/Caddy traffic monitoring (requests per second)
+- **Security** - Authentication log analysis, failed login tracking, brute force detection
+
+### v0.5 Features
+- **Security log monitoring** - Real-time analysis of auth.log, syslog, and secure logs
+- **Failed login tracking** - Monitor authentication failures with IP address tracking
+- **Brute force detection** - Automatic alerts for >20 failed logins from same IP in 5 minutes
+- **Security statistics** - Top suspicious IPs, failed vs successful login ratios, error type tracking
+- **Regex-based log parsing** - Extract timestamps, hostnames, programs, PIDs, usernames, and IPs
+- **Security layout mode** - Press `l` to emphasize security monitoring panel
+- **Windowed analysis** - Time-based metrics for failed logins per 5-minute windows
 
 ### v0.4 Features
 - **Loading modal** - Shows spinner during initial data load
 - **Help overlay** - Press `h` to see all keybindings
 - **Adjustable refresh rate** - Press `+`/`-` to speed up or slow down (1-10s)
-- **Layout modes** - Press `l` to cycle: default, cpu, network, docker, minimal
+- **Layout modes** - Press `l` to cycle: default, cpu, network, docker, security, minimal
 - **Dynamic container lists** - Auto-adjusts to available space
 - **Improved temperature detection** - Works on ARM, VMs, containers
 - **Proxy traffic monitoring** - Shows nginx/caddy requests per second
@@ -130,6 +140,7 @@ Press `l` to cycle through layouts:
 - **cpu** - Emphasize CPU monitoring
 - **network** - Emphasize network stats
 - **docker** - Emphasize container info
+- **security** - Emphasize security log monitoring
 - **minimal** - Compact essential stats only
 
 ### Configuration
@@ -151,6 +162,18 @@ Create config with `sentinel --init-config`:
   "proxy_logs": {
     "nginx": "/var/log/nginx/access.log",
     "caddy": "/var/log/caddy/access.log"
+  },
+  "security_logs": {
+    "auth": "/var/log/auth.log",
+    "secure": "/var/log/secure",
+    "syslog": "/var/log/syslog"
+  },
+  "security_alerts": {
+    "failed_login_threshold": 20,
+    "failed_login_window": 300,
+    "suspicious_ip_threshold": 10,
+    "error_rate_threshold": 10,
+    "error_rate_window": 60
   }
 }
 ```
@@ -170,6 +193,18 @@ journalctl -u sentinel -f
 - Optional: lm-sensors, curl, docker, kubectl
 
 ## Changelog
+
+### v0.5.0
+- **Security log monitoring** - Real-time analysis of Linux authentication logs
+- **Failed login tracking** - Monitor and track authentication failures by IP and user
+- **Brute force detection** - Alert system for suspicious login patterns (>20 attempts/5min)
+- **Security statistics** - Top 10 suspicious IPs, failed/successful login ratios, error type breakdown
+- **Regex-based parsing** - Extract minimum 3 fields per log entry (timestamp, hostname, program, PID, user, IP)
+- **Security layout mode** - New layout emphasizing security monitoring panel
+- **Windowed metrics** - Time-based analysis with 5-minute sliding windows
+- **Configurable alerts** - Customizable thresholds for failed login detection
+- **Multi-log support** - Parses auth.log (Debian/Ubuntu), secure (RHEL/CentOS), and syslog
+- Security alerts integrated into main alert system with color-coded severity
 
 ### v0.4.0
 - Loading modal with spinner on startup

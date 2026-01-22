@@ -43,10 +43,10 @@ from datetime import datetime, timedelta
 from collections import deque
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # Layout modes
-LAYOUT_MODES = ['default', 'cpu', 'network', 'docker', 'minimal']
+LAYOUT_MODES = ['default', 'cpu', 'network', 'docker', 'security', 'minimal']
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -70,6 +70,18 @@ DEFAULT_CONFIG = {
     'proxy_logs': {
         'nginx': '/var/log/nginx/access.log',
         'caddy': '/var/log/caddy/access.log',
+    },
+    'security_logs': {
+        'auth': '/var/log/auth.log',
+        'secure': '/var/log/secure',
+        'syslog': '/var/log/syslog',
+    },
+    'security_alerts': {
+        'failed_login_threshold': 20,
+        'failed_login_window': 300,  # 5 minutes in seconds
+        'suspicious_ip_threshold': 10,
+        'error_rate_threshold': 10,
+        'error_rate_window': 60,  # 1 minute in seconds
     },
 }
 
@@ -221,6 +233,22 @@ class SentinelMonitor:
         self.proxy_history = deque([0] * 100, maxlen=100)
         self._last_proxy_check = 0
         self._proxy_stats = {'requests': 0, 'bytes': 0, 'rps': 0.0}
+
+        # Security log monitoring
+        self.security_logs = self.config.get('security_logs', DEFAULT_CONFIG['security_logs'])
+        self.security_alerts_config = self.config.get('security_alerts', DEFAULT_CONFIG['security_alerts'])
+        self.failed_login_history = deque([0] * 100, maxlen=100)
+        self.suspicious_ip_history = deque([0] * 100, maxlen=100)
+        self._last_security_check = 0
+        self._security_cache = {}
+        self._security_events = []  # Store recent events with timestamps for windowed analysis
+        self._ip_failure_tracker = {}  # Track failures per IP with timestamps
+
+        # Update checker (non-blocking, checks once per day)
+        self._update_available = None  # None=unknown, False=up-to-date, version string=available
+        self._last_update_check = 0
+        self._update_check_interval = 86400  # 24 hours
+        self._compiled_regex = {}  # Cache compiled regex patterns for performance
 
     def _detect_default_interface(self):
         """Detect default network interface from routing table."""
@@ -1154,6 +1182,209 @@ class SentinelMonitor:
         self.proxy_history.append(stats.get('rps', 0) * 10)  # Scale for visibility
         return stats
 
+    def check_for_updates(self):
+        """Check GitHub for newer version (non-blocking, cached for 24h)."""
+        current_time = time.time()
+
+        # Only check once per day to avoid GitHub rate limits and reduce overhead
+        if current_time - self._last_update_check < self._update_check_interval:
+            return self._update_available
+
+        self._last_update_check = current_time
+
+        try:
+            # Quick, lightweight check using curl with timeout
+            # Fetches the VERSION line from the raw GitHub file
+            github_raw = "https://raw.githubusercontent.com/VidGuiCode/sentinal/main/sentinel-monitor.py"
+            cmd = f"curl -s -m 3 {github_raw} | grep -m 1 '^VERSION = ' | cut -d'\"' -f2"
+            remote_version = self.run_cmd(cmd, timeout=4)
+
+            if remote_version and remote_version != VERSION:
+                # Parse versions to compare (e.g., "0.5.0" vs "0.4.0")
+                try:
+                    remote_parts = [int(x) for x in remote_version.split('.')]
+                    current_parts = [int(x) for x in VERSION.split('.')]
+
+                    # Compare major.minor.patch
+                    if remote_parts > current_parts:
+                        self._update_available = remote_version
+                    else:
+                        self._update_available = False
+                except:
+                    self._update_available = False
+            else:
+                self._update_available = False
+
+        except:
+            # If check fails, silently continue (don't bother the user)
+            self._update_available = False
+
+        return self._update_available
+
+    def get_security_logs(self):
+        """Get security events from system logs (auth, syslog, secure)."""
+        current_time = time.time()
+
+        # Only check every 5 seconds
+        if current_time - self._last_security_check < 5:
+            return self._security_cache
+
+        self._last_security_check = current_time
+
+        # Pre-compile regex patterns for performance (cached in self._compiled_regex)
+        if not self._compiled_regex:
+            self._compiled_regex = {
+                'failed_pwd': re.compile(
+                    r'^(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\S+)\s+(\w+)\[(\d+)\]:\s+Failed password for (?:invalid user )?(\S+) from (\S+)'
+                ),
+                'success_pwd': re.compile(
+                    r'^(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\S+)\s+(\w+)\[(\d+)\]:\s+Accepted (?:password|publickey) for (\S+) from (\S+)'
+                ),
+                'perm_denied': re.compile(
+                    r'(permission denied|authentication failure|invalid user|illegal user)', re.IGNORECASE
+                ),
+                'sudo_cmd': re.compile(
+                    r'^(\w+\s+\d+\s+\d+:\d+:\d+)\s+(\S+)\s+sudo:\s+(\S+)\s+:.*COMMAND=(.+)'
+                ),
+            }
+
+        stats = {
+            'available': False,
+            'total_parsed': 0,
+            'total_unparsed': 0,
+            'failed_logins': 0,
+            'successful_logins': 0,
+            'failed_ratio': 0.0,
+            'top_ips': {},  # IP -> count mapping
+            'top_users': {},  # user -> count mapping
+            'error_types': {},  # error type -> count mapping
+            'recent_events': [],  # Last few parsed events
+            'alerts': [],  # Active security alerts
+        }
+
+        # Clean up old events (older than 5 minutes)
+        cutoff_time = current_time - self.security_alerts_config['failed_login_window']
+        self._security_events = [e for e in self._security_events if e['timestamp'] > cutoff_time]
+
+        # Clean up old IP failure tracking
+        for ip in list(self._ip_failure_tracker.keys()):
+            self._ip_failure_tracker[ip] = [t for t in self._ip_failure_tracker[ip] if t > cutoff_time]
+            if not self._ip_failure_tracker[ip]:
+                del self._ip_failure_tracker[ip]
+
+        # Try auth.log first (Debian/Ubuntu), then secure (RHEL/CentOS), then syslog
+        for log_name, log_path in self.security_logs.items():
+            if not os.path.exists(log_path):
+                continue
+
+            try:
+                # Get last 100 lines for analysis
+                output = self.run_cmd(f"tail -100 {log_path} 2>/dev/null", timeout=2)
+                if not output:
+                    continue
+
+                lines = output.strip().split('\n')
+                stats['available'] = True
+
+                for line in lines:
+                    # Use pre-compiled regex patterns for better performance on low-end servers
+                    failed_pwd = self._compiled_regex['failed_pwd'].match(line)
+                    success_pwd = self._compiled_regex['success_pwd'].match(line)
+                    perm_denied = self._compiled_regex['perm_denied'].search(line)
+                    sudo_cmd = self._compiled_regex['sudo_cmd'].match(line)
+
+                    if failed_pwd:
+                        # Extract: timestamp, hostname, program, PID, username, IP
+                        timestamp_str, hostname, program, pid, username, ip = failed_pwd.groups()
+                        stats['failed_logins'] += 1
+                        stats['total_parsed'] += 1
+
+                        # Track IP failures
+                        stats['top_ips'][ip] = stats['top_ips'].get(ip, 0) + 1
+                        if ip not in self._ip_failure_tracker:
+                            self._ip_failure_tracker[ip] = []
+                        self._ip_failure_tracker[ip].append(current_time)
+
+                        # Track user failures
+                        stats['top_users'][username] = stats['top_users'].get(username, 0) + 1
+
+                        # Store event
+                        event = {
+                            'timestamp': current_time,
+                            'type': 'failed_login',
+                            'user': username,
+                            'ip': ip,
+                            'program': program,
+                            'pid': pid
+                        }
+                        self._security_events.append(event)
+                        stats['recent_events'].append(f"Failed login: {username}@{ip}")
+
+                    elif success_pwd:
+                        timestamp_str, hostname, program, pid, username, ip = success_pwd.groups()
+                        stats['successful_logins'] += 1
+                        stats['total_parsed'] += 1
+                        stats['top_ips'][ip] = stats['top_ips'].get(ip, 0) + 1
+
+                    elif perm_denied:
+                        stats['total_parsed'] += 1
+                        error_msg = perm_denied.group(1)
+                        stats['error_types'][error_msg] = stats['error_types'].get(error_msg, 0) + 1
+
+                    elif sudo_cmd:
+                        timestamp_str, hostname, username, command = sudo_cmd.groups()
+                        stats['total_parsed'] += 1
+                        # Could track suspicious sudo commands here
+
+                    else:
+                        stats['total_unparsed'] += 1
+
+                # Calculate failed vs successful ratio
+                total_logins = stats['failed_logins'] + stats['successful_logins']
+                if total_logins > 0:
+                    stats['failed_ratio'] = stats['failed_logins'] / total_logins
+
+                # Only keep top 10 IPs and users
+                stats['top_ips'] = dict(sorted(stats['top_ips'].items(), key=lambda x: x[1], reverse=True)[:10])
+                stats['top_users'] = dict(sorted(stats['top_users'].items(), key=lambda x: x[1], reverse=True)[:10])
+
+                # Keep only last 5 events
+                stats['recent_events'] = stats['recent_events'][-5:]
+
+                # Check for alerts
+                # Alert 1: >20 failed logins from same IP in 5 minutes
+                for ip, timestamps in self._ip_failure_tracker.items():
+                    if len(timestamps) >= self.security_alerts_config['failed_login_threshold']:
+                        stats['alerts'].append({
+                            'type': 'brute_force',
+                            'message': f'Possible brute force from {ip} ({len(timestamps)} attempts)',
+                            'severity': 'danger'
+                        })
+
+                # Alert 2: High error rate in last minute
+                recent_errors = sum(1 for e in self._security_events
+                                   if e['timestamp'] > current_time - self.security_alerts_config['error_rate_window']
+                                   and e['type'] == 'failed_login')
+                if recent_errors >= self.security_alerts_config['error_rate_threshold']:
+                    stats['alerts'].append({
+                        'type': 'high_error_rate',
+                        'message': f'{recent_errors} failed logins in 1 min',
+                        'severity': 'warning'
+                    })
+
+                break  # Successfully parsed a log file
+
+            except Exception as e:
+                stats['total_unparsed'] += 1
+                pass
+
+        # Update history for graphs
+        self.failed_login_history.append(stats['failed_logins'])
+        self.suspicious_ip_history.append(len([ip for ip, count in stats['top_ips'].items() if count >= 3]))
+
+        self._security_cache = stats
+        return stats
+
     def draw_loading_modal(self, stdscr, h, w, message="Loading..."):
         """Draw a centered loading modal overlay."""
         modal_w = max(len(message) + 6, 24)
@@ -1485,6 +1716,10 @@ class SentinelMonitor:
             self.get_public_ip()
             self._last_ip_check = current_time
 
+        # Check for updates once per day (non-blocking, silent)
+        if not is_first and current_time - self._last_update_check > self._update_check_interval:
+            self.check_for_updates()
+
         self.cache = {
             'cpu': self.get_cpu_info(),
             'mem': self.get_memory_info(),
@@ -1497,6 +1732,7 @@ class SentinelMonitor:
             'docker': self.get_docker_info(skip_stats=is_first),  # Skip per-container stats on first
             'kubernetes': self.get_kubernetes_info() if not is_first else {'available': False, 'nodes': 0, 'nodes_ready': 0, 'pods_running': 0, 'pods_pending': 0, 'pods_failed': 0, 'pods': [], 'context': ''},
             'proxy': self.get_proxy_stats() if not is_first else {'requests': 0, 'bytes': 0, 'rps': 0.0, 'source': None},
+            'security': self.get_security_logs() if not is_first else {'available': False, 'total_parsed': 0, 'total_unparsed': 0, 'failed_logins': 0, 'successful_logins': 0, 'failed_ratio': 0.0, 'top_ips': {}, 'top_users': {}, 'error_types': {}, 'recent_events': [], 'alerts': []},
         }
 
         self.last_update = current_time
@@ -1551,7 +1787,15 @@ class SentinelMonitor:
                 alerts.append(('K8S FAILED', f"{failed} pods", 'danger'))
             elif pending > 0:
                 alerts.append(('K8S PENDING', f"{pending} pods", 'warning'))
-        
+
+        # Security alerts
+        security = data.get('security', {})
+        if security.get('available'):
+            # Add alerts from security log analysis
+            for alert in security.get('alerts', []):
+                alert_type = alert['type'].upper().replace('_', ' ')
+                alerts.append((alert_type, alert['message'], alert['severity']))
+
         return alerts
 
     def setup_colors(self):
@@ -1629,6 +1873,11 @@ class SentinelMonitor:
                         col1_w = int(w * 0.30)
                         col2_w = int(w * 0.20)
                         col3_w = w - col1_w - col2_w
+                    elif layout == 'security':
+                        # Security emphasized: 25% | 20% | 55% (power box gets more for security events)
+                        col1_w = w // 4
+                        col2_w = int(w * 0.20)
+                        col3_w = w - col1_w - col2_w
                     elif layout == 'minimal':
                         # Minimal: equal small columns
                         col1_w = w // 3
@@ -1643,7 +1892,7 @@ class SentinelMonitor:
                     # 2 columns side by side
                     if layout == 'cpu':
                         col1_w = int(w * 0.6)
-                    elif layout == 'network' or layout == 'docker':
+                    elif layout == 'network' or layout == 'docker' or layout == 'security':
                         col1_w = int(w * 0.4)
                     else:
                         col1_w = w // 2
@@ -1795,6 +2044,9 @@ class SentinelMonitor:
                     elif layout == 'docker':
                         net_box_h = int(top_h * 0.3)  # Network smaller
                         pwr_box_h = top_h - net_box_h  # Power/Docker gets more
+                    elif layout == 'security':
+                        net_box_h = int(top_h * 0.3)  # Network smaller
+                        pwr_box_h = top_h - net_box_h  # Power/Security gets more
                     else:
                         net_box_h = top_h // 2
                         pwr_box_h = top_h - net_box_h
@@ -2031,31 +2283,66 @@ class SentinelMonitor:
                             if line < ph:
                                 stdscr.addstr(py + line, px, "RAPL needs root", curses.color_pair(8))
                         
-                        # Docker/K8s info or processes at bottom
+                        # Docker/K8s/Security info at bottom
                         docker = data.get('docker', {})
                         k8s = data.get('kubernetes', {})
-                        
+                        security = data.get('security', {})
+
                         if line < ph - 1:
                             line += 1  # spacing
                             remaining_lines = ph - line
-                            
-                            # Calculate space for docker and k8s
+
+                            # Calculate space for docker, k8s, and security
                             has_docker = docker.get('available', False)
                             has_k8s = k8s.get('available', False)
-                            
-                            if has_docker and has_k8s:
-                                # Split space between docker and k8s
-                                docker_lines = remaining_lines // 2
-                                k8s_lines = remaining_lines - docker_lines
-                            elif has_docker:
-                                docker_lines = remaining_lines
-                                k8s_lines = 0
-                            elif has_k8s:
-                                docker_lines = 0
-                                k8s_lines = remaining_lines
-                            else:
+                            has_security = security.get('available', False)
+
+                            # Count active features and distribute lines
+                            active_features = sum([has_docker, has_k8s, has_security])
+
+                            if active_features == 0:
                                 docker_lines = 0
                                 k8s_lines = 0
+                                security_lines = 0
+                            elif active_features == 1:
+                                # One feature gets all lines
+                                if has_docker:
+                                    docker_lines = remaining_lines
+                                    k8s_lines = 0
+                                    security_lines = 0
+                                elif has_k8s:
+                                    docker_lines = 0
+                                    k8s_lines = remaining_lines
+                                    security_lines = 0
+                                else:
+                                    docker_lines = 0
+                                    k8s_lines = 0
+                                    security_lines = remaining_lines
+                            elif active_features == 2:
+                                # Two features split space
+                                if has_docker and has_k8s:
+                                    docker_lines = remaining_lines // 2
+                                    k8s_lines = remaining_lines - docker_lines
+                                    security_lines = 0
+                                elif has_docker and has_security:
+                                    docker_lines = remaining_lines // 2
+                                    k8s_lines = 0
+                                    security_lines = remaining_lines - docker_lines
+                                else:  # k8s and security
+                                    docker_lines = 0
+                                    k8s_lines = remaining_lines // 2
+                                    security_lines = remaining_lines - k8s_lines
+                            else:  # All three features
+                                # In security layout, give more space to security
+                                if layout == 'security':
+                                    security_lines = int(remaining_lines * 0.5)
+                                    docker_lines = (remaining_lines - security_lines) // 2
+                                    k8s_lines = remaining_lines - security_lines - docker_lines
+                                else:
+                                    # Split evenly among all three
+                                    docker_lines = remaining_lines // 3
+                                    k8s_lines = remaining_lines // 3
+                                    security_lines = remaining_lines - docker_lines - k8s_lines
                             
                             # Show Docker if available
                             if has_docker and docker_lines > 0:
@@ -2104,9 +2391,41 @@ class SentinelMonitor:
                                         status_color = curses.color_pair(4) if pod['status'] in ('Failed', 'Error', 'CrashLoopBackOff') else curses.color_pair(3)
                                         stdscr.addstr(py + line, px + 1, f"! {name}", status_color)
                                     line += 1
-                            
-                            # Fallback to processes if no docker/k8s
-                            if not has_docker and not has_k8s and line < ph:
+
+                            # Show Security if available
+                            if has_security and security_lines > 0 and line < ph:
+                                failed = security.get('failed_logins', 0)
+                                successful = security.get('successful_logins', 0)
+                                total_logins = failed + successful
+
+                                # Security header with failed login count
+                                color = curses.color_pair(2) if failed == 0 else curses.color_pair(3) if failed < 10 else curses.color_pair(4)
+                                stdscr.addstr(py + line, px, "sec", curses.color_pair(5))
+                                stdscr.addstr(py + line, px + 3, f" {failed}", color | curses.A_BOLD)
+                                if total_logins > 0:
+                                    stdscr.addstr(py + line, px + 3 + len(str(failed)), f"/{total_logins}", curses.color_pair(8))
+                                line += 1
+                                security_lines -= 1
+
+                                # Show top suspicious IPs
+                                top_ips = security.get('top_ips', {})
+                                ips_to_show = min(len(top_ips), security_lines)
+                                for ip, count in list(top_ips.items())[:ips_to_show]:
+                                    if line >= ph:
+                                        break
+                                    # Truncate IP to fit width
+                                    ip_display = ip[:pw - 6]
+                                    count_str = f"×{count}"
+                                    # Color code by severity
+                                    ip_color = curses.color_pair(4) if count >= 10 else curses.color_pair(3) if count >= 5 else curses.color_pair(2)
+                                    stdscr.addstr(py + line, px, f" {ip_display}", ip_color)
+                                    # Show count on the right if space
+                                    if len(ip_display) + len(count_str) + 2 < pw:
+                                        stdscr.addstr(py + line, px + pw - len(count_str), count_str, curses.color_pair(8))
+                                    line += 1
+
+                            # Fallback to processes if no docker/k8s/security
+                            if not has_docker and not has_k8s and not has_security and line < ph:
                                 stdscr.addstr(py + line, px, f"{proc['total']} tasks", curses.color_pair(7))
                                 if proc.get('top_cpu') and line + 1 < ph:
                                     line += 1
@@ -2147,7 +2466,14 @@ class SentinelMonitor:
                     stdscr.addstr(footer_y, col + 2 + len(theme_text), layout_text, curses.color_pair(5))
                     rate_text = f"[{self.refresh_rate}s]"
                     stdscr.addstr(footer_y, col + 3 + len(theme_text) + len(layout_text), rate_text, curses.color_pair(2))
-                    
+
+                    # Show update notification if available (non-intrusive, left of alerts)
+                    update_x = col + 4 + len(theme_text) + len(layout_text) + len(rate_text)
+                    if self._update_available and isinstance(self._update_available, str):
+                        update_text = f" v{self._update_available} available "
+                        if update_x + len(update_text) < w - 30:  # Leave room for alerts
+                            stdscr.addstr(footer_y, update_x, update_text, curses.color_pair(2) | curses.A_DIM)
+
                     # Show alerts on right side
                     if active_alerts:
                         alert_x = w - 2
