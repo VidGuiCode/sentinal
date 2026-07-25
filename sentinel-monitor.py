@@ -39,11 +39,38 @@ import json
 import argparse
 import socket
 import subprocess
+import threading
+import shutil
+import shlex
+# urllib.request (~2MB RSS) and http.client (~8MB, pulls in email.parser) are
+# imported lazily at their call sites: the public-IP/update collectors and the
+# Docker socket client. A Pi with no Docker and public_ip_check disabled never
+# pays for either. See _docker_conn_cls() and _collect_public_ip().
 from datetime import datetime, timedelta
 from collections import deque
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
+
+# Profiling instrumentation (active only when SENTINEL_PROFILE is set to a path)
+_PROFILE_PATH = os.environ.get('SENTINEL_PROFILE')
+_RUN_CMD_COUNT = 0
+
+# Debug logging (active only when SENTINEL_DEBUG is set to a truthy value):
+# feature_status transitions + frame-skip stats go to /tmp/sentinel-debug.log
+_DEBUG_ENABLED = os.environ.get('SENTINEL_DEBUG', '') not in ('', '0')
+_DEBUG_PATH = '/tmp/sentinel-debug.log'
+
+
+def _debug_log(msg):
+    """Append one line to the debug log; zero cost when SENTINEL_DEBUG is unset."""
+    if not _DEBUG_ENABLED:
+        return
+    try:
+        with open(_DEBUG_PATH, 'a') as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+    except OSError:
+        pass
 
 # Layout modes
 LAYOUT_MODES = ['default', 'cpu', 'network', 'docker', 'security', 'minimal']
@@ -163,9 +190,13 @@ def load_config():
                             config[key] = value
                     config['_loaded_from'] = str(config_path)
                     break
-            except Exception as e:
-                pass
-    
+            except (OSError, ValueError) as e:
+                # A malformed or unreadable config silently falling back to
+                # defaults is the same class of bug as a blank panel: the user
+                # edits a setting, nothing changes, and nothing says why.
+                config['_config_error'] = f"{config_path}: {e}"
+                _debug_log(f"config load failed: {config_path}: {e}")
+
     return config
 
 
@@ -179,6 +210,286 @@ def save_default_config():
         json.dump(DEFAULT_CONFIG, f, indent=2)
     
     return config_path
+
+
+def _format_size(b):
+    """Human-friendly compact size (matches the disk panel's existing format)."""
+    for unit in ['B', 'K', 'M', 'G', 'T']:
+        if b < 1024:
+            return f"{b:.0f}{unit}" if unit == 'B' else f"{b:.1f}{unit}"
+        b /= 1024
+    return f"{b:.1f}P"
+
+
+class DockerError(Exception):
+    """Docker Engine API failure with a classifiable state.
+
+    state: 'socket_missing' | 'no_permission' | 'unsupported_host' | 'error'
+    """
+    def __init__(self, state, detail):
+        super().__init__(detail)
+        self.state = state
+        self.detail = detail
+
+
+_DOCKER_CONN_CLS = None
+
+
+def _docker_conn_cls():
+    """Build the unix-socket HTTP connection class on first use.
+
+    Importing http.client costs ~8MB RSS (it drags in email.parser and
+    friends). On a Pi with no Docker daemon that is 8MB for a feature that
+    never runs, so the import is deferred until a socket is actually
+    contacted. Subsequent calls hit sys.modules and cost nothing.
+    """
+    global _DOCKER_CONN_CLS
+    if _DOCKER_CONN_CLS is None:
+        import http.client
+
+        class _DockerUnixHTTPConnection(http.client.HTTPConnection):
+            """Minimal HTTP/1.1 connection over the Docker unix socket."""
+            def __init__(self, socket_path, timeout=2):
+                http.client.HTTPConnection.__init__(
+                    self, 'localhost', timeout=timeout)
+                self._socket_path = socket_path
+
+            def connect(self):
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(self.timeout)
+                self.sock.connect(self._socket_path)
+
+        _DOCKER_CONN_CLS = _DockerUnixHTTPConnection
+    return _DOCKER_CONN_CLS
+
+
+class DockerClient:
+    """Read-only Docker Engine API client over the unix socket.
+
+    Replaces all `docker ...` CLI subprocess calls. Only local unix sockets
+    are supported; tcp:// / ssh:// DOCKER_HOST values are reported as
+    'unsupported_host' instead of spawning ssh or ignoring the setting.
+    """
+    API_VERSION = 'v1.41'
+
+    def __init__(self, timeout=2):
+        host = os.environ.get('DOCKER_HOST', '')
+        if host.startswith('unix://'):
+            self.socket_path = host[len('unix://'):]
+        elif host:
+            raise DockerError('unsupported_host',
+                              f'DOCKER_HOST={host} is not a local unix socket')
+        else:
+            self.socket_path = '/var/run/docker.sock'
+        self.timeout = timeout
+        # Previous per-container CPU samples for delta computation
+        # {container_id: (total_usage, system_cpu_usage)}
+        self._prev_cpu_samples = {}
+
+    def _get_json(self, path, timeout=None):
+        """GET an API endpoint and parse the JSON body. Raises DockerError."""
+        if not os.path.exists(self.socket_path):
+            raise DockerError('socket_missing', f'{self.socket_path} not found')
+        import http.client  # deferred; see _docker_conn_cls()
+        conn = _docker_conn_cls()(self.socket_path,
+                                  timeout=timeout or self.timeout)
+        status = None
+        try:
+            conn.request('GET', f'/{self.API_VERSION}{path}')
+            resp = conn.getresponse()
+            status = resp.status
+            body = resp.read()
+        except PermissionError as e:
+            raise DockerError('no_permission',
+                              f'cannot access {self.socket_path}: {e}')
+        except (OSError, http.client.HTTPException) as e:
+            raise DockerError('error', f'GET {path} failed: {e}')
+        finally:
+            conn.close()
+        if status != 200:
+            raise DockerError('error', f'GET {path} -> HTTP {status}')
+        try:
+            return json.loads(body.decode('utf-8', 'replace'))
+        except ValueError as e:
+            raise DockerError('error', f'GET {path} -> invalid JSON: {e}')
+
+    def ping(self):
+        """Cheap availability probe (GET /version is the lightest JSON endpoint)."""
+        self._get_json('/version')
+        return True
+
+    def containers(self):
+        """Container list + one-shot CPU%/mem% in the shape the panel consumes."""
+        raw = self._get_json('/containers/json?all=1')
+        containers = []
+        running = 0
+        stopped = 0
+        for c in raw:
+            cid_full = c.get('Id', '')
+            cid = cid_full[:12]
+            names = c.get('Names') or []
+            name = (names[0].lstrip('/') if names else cid)[:20]
+            is_running = c.get('State') == 'running'
+            image = (c.get('Image') or '').split('/')[-1][:15]
+            cpu_pct = 0.0
+            mem_pct = 0.0
+            if is_running:
+                running += 1
+                try:
+                    cpu_pct, mem_pct = self.container_stats(cid_full)
+                except DockerError:
+                    pass  # leave 0.0 for this container
+            else:
+                stopped += 1
+            containers.append({
+                'id': cid,
+                'name': name,
+                'status': 'running' if is_running else 'stopped',
+                'image': image,
+                'cpu': cpu_pct,
+                'mem': mem_pct,
+            })
+        containers = sorted(containers, key=lambda x: (x['status'] != 'running', -x['cpu']))
+        return {
+            'running': running,
+            'stopped': stopped,
+            'total': len(containers),
+            'containers': containers[:10],
+        }
+
+    def container_stats(self, container_id):
+        """One-shot stats -> (cpu_percent, mem_percent), computed like the CLI.
+
+        CPU% = (cpu_delta / system_delta) * online_cpus * 100. The delta is
+        taken against precpu_stats when the daemon provides it, otherwise
+        against our own previous sample (collector interval apart).
+        """
+        data = self._get_json(f'/containers/{container_id}/stats?stream=false&one-shot=true')
+        cpu_pct = 0.0
+        cpu_stats = data.get('cpu_stats') or {}
+        precpu_stats = data.get('precpu_stats') or {}
+        try:
+            total_usage = (cpu_stats.get('cpu_usage') or {}).get('total_usage', 0)
+            system_usage = cpu_stats.get('system_cpu_usage', 0)
+            prev_total = (precpu_stats.get('cpu_usage') or {}).get('total_usage', 0)
+            prev_system = precpu_stats.get('system_cpu_usage', 0)
+            if not prev_system:
+                # Daemon gave no previous sample - use our last one, if any
+                prev_total, prev_system = self._prev_cpu_samples.get(
+                    container_id, (0, 0))
+            self._prev_cpu_samples[container_id] = (total_usage, system_usage)
+            cpu_delta = total_usage - prev_total
+            system_delta = system_usage - prev_system
+            online_cpus = (cpu_stats.get('online_cpus')
+                           or len((cpu_stats.get('cpu_usage') or {}).get('percpu_usage') or [])
+                           or 1)
+            if system_delta > 0 and cpu_delta >= 0:
+                cpu_pct = (cpu_delta / system_delta) * online_cpus * 100.0
+        except (TypeError, AttributeError):
+            cpu_pct = 0.0
+        mem_pct = 0.0
+        try:
+            mem_stats = data.get('memory_stats') or {}
+            usage = mem_stats.get('usage', 0)
+            limit = mem_stats.get('limit', 0)
+            if limit > 0:
+                mem_pct = (usage / limit) * 100.0
+        except (TypeError, AttributeError, ZeroDivisionError):
+            mem_pct = 0.0
+        return cpu_pct, mem_pct
+
+    def disk_usage_volumes(self):
+        """Volume sizes in the disk-panel shape; degrades to '—' when the
+        daemon does not report SizeBytes (no per-volume shell fallback).
+
+        Verbose df can take several seconds on hosts with many images, so it
+        gets a longer timeout and falls back to the plain /volumes list.
+        """
+        volumes = []
+        raw_volumes = None
+        try:
+            df = self._get_json('/system/df?verbose=true', timeout=15)
+            raw_volumes = df.get('Volumes')
+        except DockerError:
+            pass  # fall through to the plain volume list
+        if raw_volumes is None:
+            data = self._get_json('/volumes')
+            raw_volumes = data.get('Volumes')
+        for v in (raw_volumes or [])[:5]:
+            name = (v.get('Name') or '')[:14]
+            if not name:
+                continue
+            size = '—'
+            usage = v.get('UsageData') or {}
+            size_bytes = usage.get('SizeBytes', -1)
+            if isinstance(size_bytes, int) and size_bytes >= 0:
+                size = _format_size(size_bytes)
+            volumes.append({
+                'mount': name,
+                'used': size,
+                'total': '',
+                'percent': 0,
+                'type': 'docker',
+            })
+        return volumes
+
+
+class Collector:
+    """Background data collector: runs fn() every `interval` seconds on a
+    daemon thread.
+
+    Results are published by atomically swapping a single tuple reference
+    (_published). CPython's GIL makes the attribute swap atomic, so readers
+    on the UI thread never touch a lock and never block on the collector.
+    """
+    def __init__(self, name, interval, fn, stop_event):
+        self.name = name
+        self.interval = interval
+        self.fn = fn
+        self._stop_event = stop_event
+        self._wake_event = threading.Event()
+        self._thread = None
+        # (result, error, duration_s, finished_at, generation) - one atomic ref
+        self._published = (None, None, 0.0, 0.0, 0)
+        self.subprocess_count = 0
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._loop, name=f'sentinel-collector-{self.name}', daemon=True)
+        self._thread.start()
+
+    def wake(self):
+        """Request an out-of-schedule run (e.g. user pressed a refresh key)."""
+        self._wake_event.set()
+
+    def _loop(self):
+        while not self._stop_event.is_set():
+            self.run_once()
+            # Sleep for the interval, but wake early on request or shutdown
+            self._wake_event.wait(self.interval)
+            self._wake_event.clear()
+
+    def run_once(self):
+        global _RUN_CMD_COUNT
+        start = time.monotonic()
+        spawns_before = _RUN_CMD_COUNT
+        result = None
+        error = None
+        try:
+            result = self.fn()
+        except Exception as e:  # collector threads must never die
+            error = e
+        duration = time.monotonic() - start
+        self.subprocess_count += _RUN_CMD_COUNT - spawns_before
+        prev = self._published
+        if result is None:
+            result = prev[0]  # keep the last good result on error
+        self._published = (result, error, duration, time.time(), prev[4] + 1)
+
+    def snapshot(self):
+        """(result, error, duration_s, finished_at, generation); never blocks."""
+        return self._published
+
 
 class SentinelMonitor:
     """High-performance system monitor with single-screen adaptive layout."""
@@ -223,7 +534,20 @@ class SentinelMonitor:
         self._loading = False  # Loading state for modal
         self._show_help = False  # Help overlay toggle
         self._show_diagnostics = False  # Diagnostics overlay toggle
-        
+
+        # P5: frame-skip state. The full draw path costs ~2k addstr calls, so
+        # it only runs when something visible actually changed. Everything the
+        # renderer reads is folded into _frame_signature(); between changes the
+        # loop does a 1-addstr clock tick instead of a full repaint.
+        self._last_frame_sig = None
+        self._last_clock = ''
+        # Escape hatch: force a full repaint every cycle (v0.5.x behaviour)
+        # for terminals that mis-handle partial updates, and for A/B testing.
+        self._no_frameskip = os.environ.get('SENTINEL_NO_FRAMESKIP') == '1'
+        self.frames_drawn = 0
+        self.frames_skipped = 0
+
+
         # Layout mode
         self.layout_mode = self.config.get('layout', 'default')
         
@@ -268,15 +592,204 @@ class SentinelMonitor:
             self.failed_login_history = deque([0] * 50, maxlen=50)
             self.suspicious_ip_history = deque([0] * 50, maxlen=50)
         
-        # Cache layout calculations
-        self._last_layout_dims = (0, 0, 0, 0, '')
-        self._cached_layout = None
-
         # Non-blocking update checker
         self._update_available = None
         self._last_update_check = 0
         self._update_check_interval = 604800 if self._light_mode else 86400  # Weekly in light mode
         self._compiled_regex = {}  # Cache compiled regex patterns for performance
+
+        # Cached tool paths (avoid repeated PATH lookups / subprocess spawns)
+        self._iwgetid_path = shutil.which('iwgetid')
+
+        # Frame-signature bookkeeping (P5): redraw only when something changed
+        self._data_revision = 0    # bumped by update_data on every cache rebuild
+        self._status_revision = 0  # bumped on every feature_status transition
+        self._frames_drawn = 0
+        self._frame_ticks = 0
+
+        # Per-feature status registry (P6): probes and collectors keep this
+        # current; the diagnostics modal and panel placeholders read it.
+        self.feature_status = {}
+        self._init_feature_status()
+
+        # Background collectors (P1): every slow or IO-bound feature runs off
+        # the UI thread. update_data() only merges their latest snapshots.
+        self._collector_stop = threading.Event()
+        self.collectors = {}
+        self._docker_client = None
+        proxy_interval = 10 if self._light_mode else 5
+        self._register_collector('docker', 5, self._collect_docker)
+        self._register_collector('docker_df', 30, self._collect_docker_df)
+        self._register_collector('kubernetes', 15, self._collect_kubernetes)
+        self._register_collector('wireguard', 10, self._collect_wireguard)
+        self._register_collector('proxy', proxy_interval, self.get_proxy_stats)
+        self._register_collector('security', 5, self.get_security_logs)
+        self._register_collector('processes', 5, self._collect_processes)
+        # The two network-backed collectors are the whole reason
+        # urllib.request (and through it ssl + email.parser) gets imported:
+        # ~10MB RSS, a third of Sentinel's footprint, for a public-IP readout
+        # and a version check. Light mode - which is exactly the Pi 3 / small
+        # VPS case - does without them and stays around 21MB instead of 31MB.
+        if self._light_mode:
+            self._set_feature_status(
+                'public_ip', 'unavailable',
+                'disabled in light mode (saves ~10MB RSS)',
+                'run without --light, or set light_mode: false in the config')
+            self._set_feature_status(
+                'update_check', 'unavailable',
+                'disabled in light mode (saves ~10MB RSS)',
+                'run without --light, or set light_mode: false in the config')
+        else:
+            self._register_collector('public_ip', 300, self._collect_public_ip)
+            self._register_collector('update_check', self._update_check_interval,
+                                     self._collect_update_check)
+        self._register_collector('probes', 30, self._collect_probes)
+        self._register_collector('ssid', 60, self._collect_ssid)
+        for collector in self.collectors.values():
+            collector.start()
+
+    def _register_collector(self, name, interval, fn):
+        self.collectors[name] = Collector(name, interval, fn, self._collector_stop)
+
+    def _collector_result(self, name):
+        """Latest published result of a collector, or None if it never ran."""
+        collector = self.collectors.get(name)
+        if collector is None:
+            return None
+        return collector.snapshot()[0]
+
+    def wake_collector(self, name):
+        collector = self.collectors.get(name)
+        if collector is not None:
+            collector.wake()
+
+    def stop_collectors(self):
+        """Signal all collector threads to stop. Threads are daemonic and all
+        I/O has timeouts, so process exit is never blocked by a collector."""
+        self._collector_stop.set()
+        for collector in self.collectors.values():
+            collector.wake()  # cut short the interval sleep for a prompt exit
+
+    def _set_feature_status(self, name, state, detail='', fix=''):
+        """Update one feature's status entry. Transitions bump the status
+        revision (so the TUI redraws) and are logged when SENTINEL_DEBUG=1."""
+        old = self.feature_status.get(name)
+        if old is not None and old.get('state') == state \
+                and old.get('detail') == detail and old.get('fix') == fix:
+            return  # no change
+        self.feature_status[name] = {'state': state, 'detail': detail, 'fix': fix}
+        self._status_revision += 1
+        if old is None or old.get('state') != state:
+            _debug_log(f"feature {name}: "
+                       f"{old.get('state') if old else 'init'} -> {state}"
+                       f"{(' | ' + detail) if detail else ''}")
+
+    def _apply_feature_perm(self, feature, state):
+        """Mirror a collector state into the legacy _permissions map that the
+        header/diagnostics rendering already reads."""
+        mapping = {'ok': 'ok', 'no_permission': 'no_perm',
+                   'not_installed': 'not_installed', 'socket_missing': 'not_installed',
+                   'unsupported_host': 'not_installed'}
+        if state in mapping:
+            self._permissions[feature] = mapping[state]
+
+    def _init_feature_status(self):
+        fixes = {
+            'docker': 'sudo usermod -aG docker $USER  (then re-login)',
+            'kubernetes': 'install kubectl and configure a context',
+            'wireguard': 'sudo setcap cap_net_admin+ep $(which wg)  or  NOPASSWD sudoers entry for wg',
+        }
+        for feature in ('docker', 'kubernetes', 'wireguard'):
+            perm = self._permissions.get(feature, 'not_installed')
+            state = {'ok': 'ok', 'no_perm': 'no_permission'}.get(perm, 'not_installed')
+            self._set_feature_status(feature, state, '',
+                                     fixes.get(feature, '') if state != 'ok' else '')
+        # Probe-owned features (security, proxy, rapl, battery, ...)
+        self._sync_probe_feature_status()
+        # Collector-owned meta features
+        self._set_feature_status('public_ip', 'ok' if self.config.get('public_ip_check', True)
+                                 else 'unavailable',
+                                 '' if self.config.get('public_ip_check', True)
+                                 else 'disabled in config (public_ip_check: false)')
+        self._set_feature_status('update_check', 'ok')
+
+    def _collect_probes(self):
+        """Collector (30s): re-run cheap availability/permission probes so a
+        feature fixed mid-session (group add, chmod, log file created, ...)
+        recovers without restarting sentinel. Probes are pure os.path /
+        os.access / shutil.which checks, plus at most one `wg show` spawn."""
+        self._permissions = self._detect_permissions()
+        self._sync_probe_feature_status()
+        return True
+
+    def _sync_probe_feature_status(self):
+        """Refresh feature_status for the probe-owned features from the
+        (freshly re-detected) _permissions map."""
+        p = self._permissions
+
+        # Security logs
+        if p.get('security') == 'ok':
+            self._set_feature_status('security', 'ok')
+        elif any(s == 'no_perm' for s in p.get('security_logs', {}).values()):
+            self._set_feature_status('security', 'no_permission',
+                                     'log files exist but are not readable',
+                                     'sudo usermod -aG adm,syslog $USER  (then re-login)')
+        else:
+            self._set_feature_status('security', 'not_installed',
+                                     'no auth.log / secure / syslog found')
+
+        # Proxy logs
+        if p.get('proxy') == 'ok':
+            self._set_feature_status('proxy', 'ok')
+        elif any(s == 'no_perm' for s in p.get('proxy_logs', {}).values()):
+            self._set_feature_status('proxy', 'no_permission',
+                                     'access log exists but is not readable',
+                                     'sudo chmod o+r the proxy access log')
+        else:
+            self._set_feature_status('proxy', 'not_installed',
+                                     'no nginx/caddy access log found')
+
+        # RAPL energy
+        rapl = p.get('rapl')
+        if rapl == 'ok':
+            self._set_feature_status('rapl', 'ok')
+        elif rapl == 'no_perm':
+            self._set_feature_status('rapl', 'no_permission',
+                                     'RAPL energy_uj not readable',
+                                     'sudo chmod 644 /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj')
+        else:
+            self._set_feature_status('rapl', 'not_installed',
+                                     'no RAPL powercap sysfs on this machine')
+
+        # Battery
+        if p.get('battery') == 'ok':
+            self._set_feature_status('battery', 'ok')
+        else:
+            self._set_feature_status('battery', 'not_installed',
+                                     'no battery detected')
+
+        # Temperature sensors
+        if p.get('temperature') == 'ok':
+            self._set_feature_status('temperature', 'ok')
+        else:
+            self._set_feature_status('temperature', 'not_installed',
+                                     'no thermal_zone/hwmon sensors')
+
+        # Wireless (informational: iface presence + iwgetid for SSID)
+        try:
+            ifaces = os.listdir('/sys/class/net')
+        except OSError:
+            ifaces = []
+        if any(n.startswith(('wl', 'wi')) for n in ifaces):
+            if self._iwgetid_path:
+                self._set_feature_status('wireless', 'ok')
+            else:
+                self._set_feature_status('wireless', 'not_installed',
+                                         'wireless iface present but iwgetid missing',
+                                         'install wireless-tools')
+        else:
+            self._set_feature_status('wireless', 'not_installed',
+                                     'no wireless interface')
 
     def _detect_light_hardware(self):
         """Detect low-resource hardware (e.g., Raspberry Pi, low-RAM VPS) for lighter defaults."""
@@ -301,9 +814,9 @@ class SentinelMonitor:
                             if mem_kb < 1024 * 1024:  # Less than 1GB
                                 return True
                             break
-            except:
+            except (OSError, ValueError, IndexError):
                 pass
-        except:
+        except (OSError, UnicodeDecodeError):
             pass
         return False
 
@@ -324,19 +837,21 @@ class SentinelMonitor:
         else:
             perms['docker'] = 'not_installed'
         
-        # Kubernetes - check kubectl availability (fast, short timeout)
-        kubectl_path = self.run_cmd("which kubectl 2>/dev/null", timeout=0.5)
+        # Kubernetes - check kubectl availability (no subprocess needed)
+        kubectl_path = shutil.which('kubectl')
         if kubectl_path:
             perms['kubernetes'] = 'ok'
         else:
             perms['kubernetes'] = 'not_installed'
         
         # WireGuard - check if wg binary exists and if we can use it
-        wg_path = self.run_cmd("which wg 2>/dev/null", timeout=0.5)
+        wg_path = shutil.which('wg')
         if wg_path:
-            # Quick check with short timeout to avoid hanging on dead sockets
-            test = self.run_cmd("wg show 2>&1 | head -1", timeout=0.5)
-            if test and "permission" not in test.lower() and "not permitted" not in test.lower():
+            # Quick check with short timeout to avoid hanging on dead sockets.
+            # Success is judged by exit code (wg prints nothing when no
+            # interfaces exist, which is still a working setup).
+            _out, rc = self.run_cmd_full([wg_path, 'show'], timeout=2, stderr=True)
+            if rc == 0:
                 perms['wireguard'] = 'ok'
             else:
                 perms['wireguard'] = 'no_perm'
@@ -421,7 +936,7 @@ class SentinelMonitor:
                     parts = line.strip().split()
                     if len(parts) >= 2 and parts[1] == '00000000':
                         return parts[0]
-        except:
+        except (OSError, IndexError):
             pass
         return None
 
@@ -452,17 +967,33 @@ class SentinelMonitor:
                         for remove in ['(R)', '(TM)', 'CPU', '  ']:
                             model = model.replace(remove, ' ' if remove == '  ' else '')
                         return ' '.join(model.split())[:40]
-        except:
+        except (OSError, IndexError):
             pass
         return "Unknown CPU"
 
-    def run_cmd(self, cmd, timeout=1):
-        """Run shell command and return output"""
+    def run_cmd(self, cmd, timeout=2, stderr=False):
+        """Run a command without a shell and return stdout ('' on failure).
+
+        `cmd` must be an argv list; a plain string is split with shlex (never
+        passed to a shell). Set stderr=True to merge stderr into the output.
+        """
+        stdout, _rc = self.run_cmd_full(cmd, timeout=timeout, stderr=stderr)
+        return stdout
+
+    def run_cmd_full(self, cmd, timeout=2, stderr=False):
+        """Like run_cmd but returns (stdout, returncode); rc is -1 if the
+        process could not be spawned or timed out."""
+        global _RUN_CMD_COUNT
+        _RUN_CMD_COUNT += 1
+        argv = cmd if isinstance(cmd, (list, tuple)) else shlex.split(cmd)
         try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-            return result.stdout.strip()
-        except:
-            return ""
+            result = subprocess.run(
+                argv, shell=False, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT if stderr else subprocess.DEVNULL,
+                text=True, timeout=timeout)
+            return result.stdout.strip(), result.returncode
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return "", -1
 
     def read_sys_file(self, path, cast=str):
         """Read a value from /sys and optionally cast it"""
@@ -470,7 +1001,7 @@ class SentinelMonitor:
             with open(path, "r") as f:
                 value = f.read().strip()
                 return cast(value) if value and cast else value
-        except:
+        except (OSError, ValueError):
             return None
 
     def get_cpu_info(self):
@@ -498,7 +1029,7 @@ class SentinelMonitor:
                 cpu_usage = 0.0
             
             self.last_cpu_times = {'idle': idle, 'total': total}
-        except:
+        except (OSError, ValueError, IndexError):
             cpu_usage = 0.0
         
         self.cpu_history.append(cpu_usage)
@@ -522,7 +1053,7 @@ class SentinelMonitor:
             with open('/proc/loadavg', 'r') as f:
                 loads = f.read().split()[:3]
                 load_avg = [float(x) for x in loads]
-        except:
+        except (OSError, ValueError, IndexError):
             load_avg = [0.0, 0.0, 0.0]
 
         # Determine CPU status based on frequency
@@ -578,7 +1109,7 @@ class SentinelMonitor:
                 core_usages.append(usage)
             
             return core_usages
-        except:
+        except (ValueError, IndexError):
             return [0.0] * self.cpu_cores
 
     def _get_cpu_temp(self):
@@ -589,7 +1120,7 @@ class SentinelMonitor:
             try:
                 temp = int(thermal_zone.read_text().strip())
                 return temp / 1000.0
-            except:
+            except (OSError, ValueError):
                 pass
         
         hwmon_base = Path('/sys/class/hwmon')
@@ -617,9 +1148,9 @@ class SentinelMonitor:
                         temp = int(temp_file.read_text().strip())
                         if temp > 0:
                             return temp / 1000.0
-                    except:
+                    except (OSError, ValueError):
                         continue
-        except:
+        except OSError:
             pass
         return 0.0
 
@@ -635,7 +1166,7 @@ class SentinelMonitor:
                         total_freq += freq
                         count += 1
             return (total_freq / count / 1000.0) if count > 0 else 0.0  # Convert to GHz
-        except:
+        except (OSError, ValueError, IndexError):
             return 0.0
 
     def _get_fan_rpm(self):
@@ -650,7 +1181,7 @@ class SentinelMonitor:
                     rpm = int(fan_file.read_text().strip())
                     if rpm > 0:
                         return rpm
-        except:
+        except (OSError, ValueError):
             pass
         return 0
 
@@ -678,7 +1209,7 @@ class SentinelMonitor:
                 'available': available,
                 'percent': percent
             }
-        except:
+        except (OSError, ValueError, IndexError):
             return {'used': 0, 'total': 0, 'available': 0, 'percent': 0}
 
     def get_battery_info(self):
@@ -735,19 +1266,13 @@ class SentinelMonitor:
                 'cycle_count': read("cycle_count", int) or None
             }
             return battery_info
-        except:
+        except (OSError, ValueError, TypeError):
             return {'exists': False}
 
     def get_disk_usage(self):
-        """Get disk usage - optimized with os.statvfs (no subprocess)."""
+        """Get disk usage - os.statvfs only, no subprocess. Docker volumes are
+        merged in update_data() from the docker_df background collector."""
         disks = []
-        
-        def format_size(b):
-            for unit in ['B', 'K', 'M', 'G', 'T']:
-                if b < 1024:
-                    return f"{b:.0f}{unit}" if unit == 'B' else f"{b:.1f}{unit}"
-                b /= 1024
-            return f"{b:.1f}P"
         
         # Regular mount points
         for mount in ['/', '/home']:
@@ -762,81 +1287,15 @@ class SentinelMonitor:
                 percent = int((used_bytes / total_bytes) * 100) if total_bytes > 0 else 0
                 disks.append({
                     'mount': mount,
-                    'used': format_size(used_bytes),
-                    'total': format_size(total_bytes),
+                    'used': _format_size(used_bytes),
+                    'total': _format_size(total_bytes),
                     'percent': percent,
                     'type': 'disk'
                 })
-            except:
+            except OSError:
                 pass
         
-        # Docker volumes (if Docker is available)
-        docker_volumes = self._get_docker_volumes()
-        if docker_volumes:
-            disks.extend(docker_volumes)
-        
         return disks
-
-    def _get_docker_volumes(self):
-        """Get Docker volume usage information - respects permission cache."""
-        volumes = []
-        
-        # Check permission cache first
-        if self._permissions.get('docker') != 'ok':
-            return volumes
-        
-        try:
-            # Get volume sizes using docker system df -v (volumes section)
-            output = self.run_cmd("docker system df -v 2>/dev/null")
-            if output and "permission denied" not in output.lower():
-                in_volumes = False
-                for line in output.strip().split('\n'):
-                    # Look for VOLUME NAME header
-                    if 'VOLUME NAME' in line:
-                        in_volumes = True
-                        continue
-                    # Stop at next section (empty line or new header)
-                    if in_volumes:
-                        if not line.strip() or line.startswith('REPOSITORY') or line.startswith('CONTAINER'):
-                            break
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            name = parts[0][:14]
-                            # Size is typically the 3rd column (after LINKS)
-                            size = parts[-1] if len(parts) >= 3 else '—'
-                            volumes.append({
-                                'mount': name,
-                                'used': size,
-                                'total': '',
-                                'percent': 0,
-                                'type': 'docker'
-                            })
-                if volumes:
-                    return volumes[:5]  # Limit to 5 volumes
-            
-            # Fallback: get volume names and try to get sizes individually
-            output = self.run_cmd("docker volume ls --format '{{.Name}}' 2>/dev/null")
-            if not output or "permission denied" in output.lower():
-                return volumes
-            
-            vol_names = output.strip().split('\n') if output.strip() else []
-            for name in vol_names[:5]:
-                if not name:
-                    continue
-                # Try to get size via inspect
-                size_out = self.run_cmd(f"docker system df -v 2>/dev/null | grep -E '^{name[:20]}' | awk '{{print $NF}}'")
-                size = size_out.strip() if size_out and size_out.strip() else '—'
-                volumes.append({
-                    'mount': name[:14],
-                    'used': size,
-                    'total': '',
-                    'percent': 0,
-                    'type': 'docker'
-                })
-        except:
-            pass
-        
-        return volumes
 
     def get_energy_info(self):
         """Get system energy consumption (RAPL for desktops, battery for laptops)."""
@@ -866,7 +1325,7 @@ class SentinelMonitor:
                 
                 self.last_rapl = {'energy': current_energy, 'time': current_time}
                 self.power_history.append(energy['power_watts'])
-            except:
+            except (OSError, ValueError, ZeroDivisionError):
                 pass
         
         # If no RAPL, check for battery power draw
@@ -931,7 +1390,10 @@ class SentinelMonitor:
             else:
                 conn_type = "virtual"
 
-        ssid = self.run_cmd("iwgetid -r 2>/dev/null") if conn_type == "wireless" else ""
+        # SSID comes from the background collector: iwgetid is a subprocess
+        # spawn with a 1s timeout, and get_network_info() runs inline on the
+        # render path, so calling it here stalled the UI once per refresh.
+        ssid = self._collector_result('ssid') or ""
 
         connected_peers = sum(1 for peer in vpn_connections if peer.get('connected'))
         total_peers = len(vpn_connections)
@@ -980,22 +1442,37 @@ class SentinelMonitor:
             self._cached_local_ip = ip
             self._cached_local_ip_time = current_time
             return ip
-        except:
+        except OSError:
             self._cached_local_ip = "N/A"
             self._cached_local_ip_time = current_time
             return "N/A"
 
     def get_vpn_connections(self):
-        """Return WireGuard peers with quick stats - respects permission cache."""
-        # Skip if WireGuard is not available or no permission
-        if self._permissions.get('wireguard') == 'not_installed':
+        """Latest WireGuard peers from the background collector - never
+        blocks and never spawns a subprocess on the UI thread."""
+        return self._collector_result('wireguard') or []
+
+    def _collect_wireguard(self):
+        """Collector (10s): WireGuard peers with quick stats."""
+        wg_path = shutil.which('wg')
+        if not wg_path:
+            self._permissions['wireguard'] = 'not_installed'
+            self._set_feature_status('wireguard', 'not_installed',
+                                     'wg binary not found in PATH',
+                                     'install wireguard-tools')
             return []
-        if self._permissions.get('wireguard') == 'no_perm':
-            self.wg_permission_denied = True
-            return []
-        
-        dump, permission_denied = self.get_wireguard_dump()
+
+        dump, permission_denied = self._wireguard_dump(wg_path)
         self.wg_permission_denied = permission_denied and not dump
+        if permission_denied and not dump:
+            self._permissions['wireguard'] = 'no_perm'
+            self._set_feature_status('wireguard', 'no_permission',
+                                     'wg show requires elevated privileges',
+                                     'sudo setcap cap_net_admin+ep $(which wg)  or  NOPASSWD sudoers entry for wg')
+            return []
+        self._permissions['wireguard'] = 'ok'
+        self._set_feature_status('wireguard', 'ok')
+
         connections = []
         if not dump:
             return connections
@@ -1020,7 +1497,7 @@ class SentinelMonitor:
             def safe_int(value):
                 try:
                     return int(value)
-                except:
+                except (ValueError, TypeError):
                     return 0
 
             handshake = safe_int(parts[5])
@@ -1056,22 +1533,15 @@ class SentinelMonitor:
             })
         return connections
 
-    def get_wireguard_dump(self):
-        """Return raw wg dump output, attempting sudo if necessary."""
-        # Check cached permission first
-        wg_perm = self._permissions.get('wireguard', 'not_installed')
-        if wg_perm == 'not_installed':
-            return "", False
-        if wg_perm == 'no_perm':
-            return "", True
-        
-        commands = [
-            "wg show all dump 2>&1",
-            "sudo -n wg show all dump 2>&1"
-        ]
+    def _wireguard_dump(self, wg_path):
+        """Raw 'wg show all dump' output (argv list, no shell), sudo -n fallback."""
+        commands = [[wg_path, 'show', 'all', 'dump']]
+        sudo_path = shutil.which('sudo')
+        if sudo_path:
+            commands.append([sudo_path, '-n', wg_path, 'show', 'all', 'dump'])
         permission_seen = False
         for cmd in commands:
-            output = self.run_cmd(cmd)
+            output = self.run_cmd(cmd, timeout=3, stderr=True)
             if not output:
                 continue
             lower = output.lower()
@@ -1081,225 +1551,205 @@ class SentinelMonitor:
             return output, False
         return "", permission_seen
 
-    def get_public_ip(self):
-        """Get public IP"""
-        try:
-            ip = self.run_cmd("curl -s --max-time 2 ifconfig.me 2>/dev/null || curl -s --max-time 2 icanhazip.com")
-            if ip and re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
-                self._public_ip_cache = ip
-            else:
-                self._public_ip_cache = "N/A"
-        except:
+    def _collect_ssid(self):
+        """Collector (60s): WiFi SSID via iwgetid.
+
+        iwgetid is a subprocess spawn with a 1s timeout and get_network_info()
+        runs inline on the render path, so this used to stall the UI once per
+        refresh. The SSID only changes on roam/reconnect, so 60s is ample.
+        """
+        if not self._iwgetid_path:
+            return ""
+        iface = self._detect_default_interface()
+        if not iface or not iface.startswith(("wl", "wi")):
+            return ""
+        return self.run_cmd([self._iwgetid_path, '-r'], timeout=1)
+
+    def _collect_public_ip(self):
+        """Collector (300s): public IP via urllib - no subprocess."""
+        if not self.config.get('public_ip_check', True):
             self._public_ip_cache = "N/A"
+            self._set_feature_status('public_ip', 'unavailable',
+                                     'disabled in config (public_ip_check: false)')
+            return "N/A"
+        # Deferred import: urllib.request pulls in ~2MB of RSS and is only
+        # needed by this collector and the update check.
+        import urllib.request
+        import urllib.error
+        for url in ('https://ifconfig.me', 'https://icanhazip.com'):
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'curl/8.0'})
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    ip = resp.read(64).decode('ascii', 'replace').strip()
+                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+                    self._public_ip_cache = ip
+                    self._set_feature_status('public_ip', 'ok')
+                    return ip
+            except (OSError, ValueError, urllib.error.URLError):
+                continue
+        self._public_ip_cache = "N/A"
+        self._set_feature_status('public_ip', 'error',
+                                 'all public-IP endpoints unreachable')
+        return "N/A"
 
     def get_processes(self):
-        """Get process information - direct /proc reads, no subprocess."""
-        try:
-            pids = [d for d in os.listdir('/proc') if d.isdigit()]
-            total = len(pids)
-        except:
-            total = 0
-            pids = []
-        
-        current_time = time.time()
-        if not hasattr(self, '_last_proc_check') or current_time - self._last_proc_check > 5:
-            self._last_proc_check = current_time
-            
-            top_cpu_name = ""
-            top_cpu_delta = 0
-            top_mem_name = ""
-            top_mem_kb = 0
-            
-            # Initialize previous CPU tracking
-            if not hasattr(self, '_prev_proc_cpu'):
-                self._prev_proc_cpu = {}
-            
-            current_cpu = {}
-            
-            for pid_str in pids:
-                try:
-                    # Read /proc/<pid>/stat for CPU time
-                    with open(f'/proc/{pid_str}/stat', 'r') as f:
-                        stat = f.read().strip()
-                    
-                    # Parse: format is "pid (comm) state utime stime ..."
-                    # Find first '(' and first ')' after it to get comm
-                    lparen = stat.find('(')
-                    if lparen == -1:
-                        continue
-                    rparen = stat.find(')', lparen)
-                    if rparen == -1:
-                        continue
-                    
-                    comm = stat[lparen + 1:rparen]
-                    # After ')', the rest of the fields start with a space
-                    rest = stat[rparen + 1:].strip()
-                    parts = rest.split()
-                    
-                    # utime is field 14, stime is field 15 (0-indexed: 12, 13)
-                    if len(parts) >= 14:
-                        utime = int(parts[12])
-                        stime = int(parts[13])
-                        total_cpu = utime + stime
-                        current_cpu[pid_str] = (comm, total_cpu)
-                        
-                        # Calculate delta from previous check
-                        prev = self._prev_proc_cpu.get(pid_str)
-                        if prev is not None:
-                            delta = total_cpu - prev
-                            if delta > top_cpu_delta:
-                                top_cpu_delta = delta
-                                top_cpu_name = comm
-                except:
-                    continue
-                
-                try:
-                    # Read /proc/<pid>/status for memory (RSS)
-                    with open(f'/proc/{pid_str}/status', 'r') as f:
-                        for line in f:
-                            if line.startswith('VmRSS:'):
-                                mem_kb = int(line.split()[1])
-                                if mem_kb > top_mem_kb:
-                                    top_mem_kb = mem_kb
-                                    # Get name from current_cpu if we parsed it, otherwise skip
-                                    if pid_str in current_cpu:
-                                        top_mem_name = current_cpu[pid_str][0]
-                                break
-                except:
-                    continue
-            
-            # Save current CPU times for next delta calculation
-            self._prev_proc_cpu = {k: v[1] for k, v in current_cpu.items()}
-            
-            # Convert CPU ticks to approximate percentage (over 5s interval)
-            # sysconf may not exist on all Python builds; fallback to 100 Hz
-            try:
-                ticks_per_sec = os.sysconf(os.sysconf_names.get('SC_CLK_TCK', 2))
-            except:
-                ticks_per_sec = 100
-            if ticks_per_sec <= 0:
-                ticks_per_sec = 100
-            
-            cpu_pct = (top_cpu_delta / ticks_per_sec / 5.0) * 100
-            
-            def shorten(s, max_len=22):
-                if not s or len(s) <= max_len:
-                    return s
-                return s[:max_len-1] + "…"
-            
-            self._cached_top_cpu = f"{shorten(top_cpu_name)} {cpu_pct:.1f}%" if top_cpu_name else ""
-            self._cached_top_mem = f"{shorten(top_mem_name)} {top_mem_kb / 1024:.1f}M" if top_mem_name else ""
-        
-        return {
-            'total': total,
-            'top_cpu': getattr(self, '_cached_top_cpu', ''),
-            'top_mem': getattr(self, '_cached_top_mem', '')
-        }
-
-    def get_docker_info(self, skip_stats=False):
-        """Get Docker container information - respects permission cache.
-        
-        Args:
-            skip_stats: If True, skip per-container stats (faster startup)
-        """
-        result = {
-            'available': False,
-            'running': 0,
-            'stopped': 0,
-            'total': 0,
-            'containers': []
-        }
-        
-        # Check permission cache first
-        if self._permissions.get('docker') != 'ok':
-            return result
-        
-        # Cache docker availability check
-        if self._docker_available is None:
-            docker_check = self.run_cmd("which docker 2>/dev/null")
-            self._docker_available = bool(docker_check) and os.path.exists('/var/run/docker.sock')
-        
-        if not self._docker_available:
-            return result
-        
-        # Cache docker stats - only fetch every 10 seconds (very expensive)
-        current_time = time.time()
-        use_cached_stats = hasattr(self, '_docker_stats_cache') and (current_time - getattr(self, '_docker_stats_time', 0) < 10)
-        
-        try:
-            # Get container list
-            output = self.run_cmd("docker ps -a --format '{{.ID}}|{{.Names}}|{{.Status}}|{{.Image}}' 2>/dev/null")
-            if not output or "permission denied" in output.lower() or "Cannot connect" in output:
-                self._docker_available = False
-                return result
-            
-            result['available'] = True
-            containers = []
-            running_ids = []
-            
-            for line in output.strip().split('\n'):
-                if not line:
-                    continue
-                parts = line.split('|')
-                if len(parts) >= 4:
-                    container_id, name, status, image = parts[:4]
-                    is_running = status.lower().startswith('up')
-                    
-                    cpu_pct = mem_pct = 0.0
-                    if is_running:
-                        running_ids.append(container_id[:12])
-                        # Use cached stats if available
-                        if use_cached_stats and container_id[:12] in self._docker_stats_cache:
-                            cpu_pct, mem_pct = self._docker_stats_cache[container_id[:12]]
-                    
-                    containers.append({
-                        'id': container_id[:12],
-                        'name': name[:20],
-                        'status': 'running' if is_running else 'stopped',
-                        'image': image.split('/')[-1][:15],
-                        'cpu': cpu_pct,
-                        'mem': mem_pct
-                    })
-                    
-                    if is_running:
-                        result['running'] += 1
-                    else:
-                        result['stopped'] += 1
-            
-            # Fetch stats for all running containers in ONE call (much faster)
-            if running_ids and not skip_stats and not use_cached_stats:
-                stats_output = self.run_cmd("docker stats --no-stream --format '{{.ID}}|{{.CPUPerc}}|{{.MemPerc}}' 2>/dev/null", timeout=3)
-                if stats_output:
-                    self._docker_stats_cache = {}
-                    self._docker_stats_time = current_time
-                    for line in stats_output.strip().split('\n'):
-                        if '|' in line:
-                            parts = line.split('|')
-                            if len(parts) >= 3:
-                                cid = parts[0][:12]
-                                try:
-                                    cpu = float(parts[1].replace('%', ''))
-                                    mem = float(parts[2].replace('%', ''))
-                                    self._docker_stats_cache[cid] = (cpu, mem)
-                                    # Update container in list
-                                    for c in containers:
-                                        if c['id'] == cid:
-                                            c['cpu'] = cpu
-                                            c['mem'] = mem
-                                            break
-                                except:
-                                    pass
-            
-            result['total'] = len(containers)
-            result['containers'] = sorted(containers, key=lambda x: (x['status'] != 'running', -x['cpu']))[:10]
-            
-        except Exception as e:
-            pass
-        
+        """Latest process summary from the background collector (never blocks)."""
+        result = self._collector_result('processes')
+        if result is None:
+            return {'total': 0, 'top_cpu': '', 'top_mem': ''}
         return result
 
+    def _collect_processes(self):
+        """Collector (5s): scan /proc/<pid>/stat only.
+
+        RSS comes from stat field 24 (pages), so the old per-PID
+        /proc/<pid>/status line-scan is dropped entirely.
+        """
+        try:
+            pids = [d for d in os.listdir('/proc') if d.isdigit()]
+        except OSError:
+            pids = []
+        total = len(pids)
+
+        current_time = time.time()
+        prev_cpu_map = getattr(self, '_prev_proc_cpu', {})
+        prev_time = getattr(self, '_prev_proc_time', None)
+        interval = (current_time - prev_time) if prev_time else 0
+
+        try:
+            ticks_per_sec = os.sysconf('SC_CLK_TCK')
+            page_size = os.sysconf('SC_PAGE_SIZE')
+        except (ValueError, OSError, AttributeError):
+            ticks_per_sec = 100
+            page_size = 4096
+        if ticks_per_sec <= 0:
+            ticks_per_sec = 100
+        if page_size <= 0:
+            page_size = 4096
+
+        top_cpu_name = ""
+        top_cpu_delta = 0
+        top_mem_name = ""
+        top_mem_kb = 0
+        current_cpu = {}
+
+        for pid_str in pids:
+            try:
+                with open(f'/proc/{pid_str}/stat', 'r') as f:
+                    stat = f.read().strip()
+            except OSError:
+                continue  # process vanished between listdir and read
+
+            try:
+                # Format: "pid (comm) state utime stime ... rss ..."
+                # comm may contain spaces/parens; fields after the last ')'
+                # start at field 3 (state).
+                rparen = stat.rfind(')')
+                lparen = stat.find('(')
+                if lparen == -1 or rparen <= lparen:
+                    continue
+                comm = stat[lparen + 1:rparen]
+                parts = stat[rparen + 2:].split()
+                utime = int(parts[11])       # field 14
+                stime = int(parts[12])       # field 15
+                rss_pages = int(parts[21])   # field 24
+            except (ValueError, IndexError):
+                continue  # short read / PID reused mid-parse
+
+            total_cpu = utime + stime
+            current_cpu[pid_str] = total_cpu
+
+            prev = prev_cpu_map.get(pid_str)
+            if prev is not None:
+                delta = total_cpu - prev
+                if delta > top_cpu_delta:
+                    top_cpu_delta = delta
+                    top_cpu_name = comm
+
+            mem_kb = (rss_pages * page_size) // 1024
+            if mem_kb > top_mem_kb:
+                top_mem_kb = mem_kb
+                top_mem_name = comm
+
+        # Save current CPU times for next delta calculation
+        self._prev_proc_cpu = current_cpu
+        self._prev_proc_time = current_time
+
+        if interval > 0:
+            cpu_pct = (top_cpu_delta / ticks_per_sec / interval) * 100
+        else:
+            cpu_pct = 0.0
+
+        def shorten(s, max_len=22):
+            if not s or len(s) <= max_len:
+                return s
+            return s[:max_len-1] + "…"
+
+        return {
+            'total': total,
+            'top_cpu': f"{shorten(top_cpu_name)} {cpu_pct:.1f}%" if top_cpu_name else "",
+            'top_mem': f"{shorten(top_mem_name)} {top_mem_kb / 1024:.1f}M" if top_mem_name else "",
+        }
+
+    def get_docker_info(self):
+        """Latest Docker info from the background collector (never blocks)."""
+        result = self._collector_result('docker')
+        if result is None:
+            return {'available': False, 'running': 0, 'stopped': 0,
+                    'total': 0, 'containers': []}
+        return result
+
+    def _get_docker_client(self):
+        """Lazily create the shared Docker API client (raises DockerError)."""
+        if self._docker_client is None:
+            self._docker_client = DockerClient(timeout=2)
+        return self._docker_client
+
+    def _collect_docker(self):
+        """Collector (5s): container list + CPU/mem via the Engine API socket."""
+        result = {'available': False, 'running': 0, 'stopped': 0,
+                  'total': 0, 'containers': []}
+        try:
+            client = self._get_docker_client()
+            data = client.containers()
+        except DockerError as e:
+            self._docker_available = False
+            self._apply_feature_perm('docker', e.state)
+            fix = ''
+            if e.state == 'no_permission':
+                fix = 'sudo usermod -aG docker $USER  (then re-login)'
+            elif e.state == 'socket_missing':
+                fix = 'start the docker daemon / check /var/run/docker.sock'
+            self._set_feature_status('docker', e.state, e.detail, fix)
+            return result
+        result.update(data)
+        result['available'] = True
+        self._docker_available = True
+        self._apply_feature_perm('docker', 'ok')
+        self._set_feature_status('docker', 'ok')
+        return result
+
+    def _collect_docker_df(self):
+        """Collector (30s): docker volume sizes via the Engine API socket."""
+        try:
+            client = self._get_docker_client()
+            return client.disk_usage_volumes()
+        except DockerError:
+            return []
+
     def get_kubernetes_info(self):
-        """Get Kubernetes pod/node information."""
+        """Latest Kubernetes info from the background collector (never blocks)."""
+        result = self._collector_result('kubernetes')
+        if result is None:
+            return {'available': False, 'nodes': 0, 'nodes_ready': 0,
+                    'pods_running': 0, 'pods_pending': 0, 'pods_failed': 0,
+                    'pods': [], 'context': ''}
+        return result
+
+    def _collect_kubernetes(self):
+        """Collector (15s): kubectl node/pod info. kubectl stays a subprocess
+        (kubeconfig auth has no sane stdlib alternative) but runs off-thread
+        with argv lists and a 5s timeout; zero spawns when not installed."""
         result = {
             'available': False,
             'nodes': 0,
@@ -1310,82 +1760,89 @@ class SentinelMonitor:
             'pods': [],
             'context': ''
         }
-        
-        # Cache kubectl availability check
-        if self._kubectl_available is None:
-            kubectl_check = self.run_cmd("which kubectl 2>/dev/null")
-            self._kubectl_available = bool(kubectl_check)
-        
-        if not self._kubectl_available:
+
+        kubectl_path = shutil.which('kubectl')
+        if not kubectl_path:
+            self._kubectl_available = False
+            self._apply_feature_perm('kubernetes', 'not_installed')
+            self._set_feature_status('kubernetes', 'not_installed',
+                                     'kubectl not found in PATH',
+                                     'install kubectl')
             return result
-        
-        try:
-            # Get current context
-            context = self.run_cmd("kubectl config current-context 2>/dev/null")
-            if not context or "error" in context.lower():
-                return result
-            
-            result['available'] = True
-            result['context'] = context[:20]
-            
-            # Get node status
-            nodes_output = self.run_cmd("kubectl get nodes --no-headers 2>/dev/null")
-            if nodes_output:
-                for line in nodes_output.strip().split('\n'):
-                    if line:
-                        result['nodes'] += 1
-                        if 'Ready' in line and 'NotReady' not in line:
-                            result['nodes_ready'] += 1
-            
-            # Get pod status (all namespaces, limit output)
-            pods_output = self.run_cmd("kubectl get pods -A --no-headers 2>/dev/null | head -50")
-            if pods_output:
-                pods = []
-                for line in pods_output.strip().split('\n'):
-                    if not line:
-                        continue
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        namespace = parts[0][:10]
-                        name = parts[1][:25]
-                        ready = parts[2]
-                        status = parts[3]
-                        
-                        if status == 'Running':
-                            result['pods_running'] += 1
-                        elif status == 'Pending':
-                            result['pods_pending'] += 1
-                        elif status in ('Failed', 'Error', 'CrashLoopBackOff'):
-                            result['pods_failed'] += 1
-                        
-                        # Parse ready count
-                        ready_count = 0
-                        total_count = 0
-                        if '/' in ready:
-                            try:
-                                ready_count, total_count = map(int, ready.split('/'))
-                            except:
-                                pass
-                        
-                        pods.append({
-                            'namespace': namespace,
-                            'name': name,
-                            'ready': ready,
-                            'status': status,
-                            'ready_count': ready_count,
-                            'total_count': total_count
-                        })
-                
-                # Sort: failed first, then pending, then by name
-                result['pods'] = sorted(pods, key=lambda x: (
-                    x['status'] == 'Running',
-                    x['status'] != 'Failed',
-                    x['name']
-                ))[:10]
-            
-        except Exception as e:
-            pass
-        
+        self._kubectl_available = True
+
+        # Get current context
+        context = self.run_cmd([kubectl_path, 'config', 'current-context'],
+                               timeout=5, stderr=True)
+        if not context or "error" in context.lower():
+            self._apply_feature_perm('kubernetes', 'ok')
+            self._set_feature_status('kubernetes', 'error',
+                                     'no current context or cluster unreachable',
+                                     'kubectl config use-context <name>')
+            return result
+
+        result['available'] = True
+        result['context'] = context.split('\n')[0][:20]
+        self._apply_feature_perm('kubernetes', 'ok')
+        self._set_feature_status('kubernetes', 'ok')
+
+        # Get node status
+        nodes_output = self.run_cmd([kubectl_path, 'get', 'nodes', '--no-headers'],
+                                    timeout=5)
+        if nodes_output:
+            for line in nodes_output.strip().split('\n'):
+                if line:
+                    result['nodes'] += 1
+                    if 'Ready' in line and 'NotReady' not in line:
+                        result['nodes_ready'] += 1
+
+        # Get pod status (all namespaces, first 50 lines)
+        pods_output = self.run_cmd([kubectl_path, 'get', 'pods', '-A', '--no-headers'],
+                                   timeout=5)
+        if pods_output:
+            pods = []
+            for line in pods_output.strip().split('\n')[:50]:
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 4:
+                    namespace = parts[0][:10]
+                    name = parts[1][:25]
+                    ready = parts[2]
+                    status = parts[3]
+
+                    if status == 'Running':
+                        result['pods_running'] += 1
+                    elif status == 'Pending':
+                        result['pods_pending'] += 1
+                    elif status in ('Failed', 'Error', 'CrashLoopBackOff'):
+                        result['pods_failed'] += 1
+
+                    # Parse ready count
+                    ready_count = 0
+                    total_count = 0
+                    if '/' in ready:
+                        try:
+                            ready_count, total_count = map(int, ready.split('/'))
+                        except ValueError:
+                            pass
+
+                    pods.append({
+                        'namespace': namespace,
+                        'name': name,
+                        'ready': ready,
+                        'status': status,
+                        'ready_count': ready_count,
+                        'total_count': total_count
+                    })
+
+            # Sort: failed first, then pending, then by name
+            result['pods'] = sorted(pods, key=lambda x: (
+                x['status'] == 'Running',
+                x['status'] != 'Failed',
+                x['name']
+            ))[:10]
+
         return result
 
     def get_uptime(self):
@@ -1395,7 +1852,7 @@ class SentinelMonitor:
                 uptime_seconds = float(f.read().split()[0])
             uptime = timedelta(seconds=int(uptime_seconds))
             return uptime.days, uptime.seconds // 3600, (uptime.seconds % 3600) // 60
-        except:
+        except (OSError, ValueError, IndexError):
             return 0, 0, 0
 
     def _read_log_tail(self, log_path, max_lines=100):
@@ -1424,7 +1881,7 @@ class SentinelMonitor:
                         lines = lines[1:]
                     # Keep only last max_lines
                     return lines[-max_lines:] if len(lines) > max_lines else lines
-                except:
+                except OSError:
                     # Fallback: read from start (for very small files or errors)
                     f.seek(0)
                     lines = []
@@ -1433,7 +1890,7 @@ class SentinelMonitor:
                         if len(lines) > max_lines * 2:
                             lines = lines[-max_lines:]
                     return lines[-max_lines:] if len(lines) > max_lines else lines
-        except:
+        except OSError:
             return []
 
     def get_proxy_stats(self):
@@ -1475,7 +1932,7 @@ class SentinelMonitor:
                             if bytes_str.isdigit():
                                 total_bytes += int(bytes_str)
                         recent_count += 1
-                    except:
+                    except (ValueError, IndexError):
                         recent_count += 1
                 
                 if recent_count > 0:
@@ -1485,41 +1942,47 @@ class SentinelMonitor:
                     stats['source'] = proxy_name
                     break
                     
-            except:
+            except OSError:
                 pass
         
         self._proxy_stats = stats
         self.proxy_history.append(stats.get('rps', 0) * 10)
         return stats
 
-    def check_for_updates(self):
-        """Check GitHub for newer version (non-blocking, cached)."""
-        current_time = time.time()
-
-        if current_time - self._last_update_check < self._update_check_interval:
+    def _collect_update_check(self):
+        """Collector (86400s; 604800s light): check GitHub for a newer version
+        via urllib - no subprocess, fetched at most once per interval."""
+        github_raw = "https://raw.githubusercontent.com/VidGuiCode/sentinel/main/sentinel-monitor.py"
+        import urllib.request  # deferred; see _collect_public_ip
+        import urllib.error
+        try:
+            req = urllib.request.Request(github_raw, headers={'User-Agent': f'sentinel/{VERSION}'})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                head = resp.read(8192).decode('utf-8', 'replace')
+        except (OSError, ValueError, urllib.error.URLError):
+            self._update_available = False
+            self._set_feature_status('update_check', 'error',
+                                     'update check fetch failed (offline?)')
             return self._update_available
 
-        self._last_update_check = current_time
+        remote_version = None
+        for line in head.splitlines():
+            if line.startswith('VERSION = '):
+                parts = line.split('"')
+                if len(parts) >= 2:
+                    remote_version = parts[1]
+                break
 
-        try:
-            github_raw = "https://raw.githubusercontent.com/VidGuiCode/sentinel/main/sentinel-monitor.py"
-            cmd = f"curl -s -m 3 {github_raw} | grep -m 1 '^VERSION = ' | cut -d'\"' -f2"
-            remote_version = self.run_cmd(cmd, timeout=4)
+        self._set_feature_status('update_check', 'ok')
 
-            if remote_version and remote_version != VERSION:
-                try:
-                    remote_parts = [int(x) for x in remote_version.split('.')]
-                    current_parts = [int(x) for x in VERSION.split('.')]
-                    if remote_parts > current_parts:
-                        self._update_available = remote_version
-                    else:
-                        self._update_available = False
-                except:
-                    self._update_available = False
-            else:
+        if remote_version and remote_version != VERSION:
+            try:
+                remote_parts = [int(x) for x in remote_version.split('.')]
+                current_parts = [int(x) for x in VERSION.split('.')]
+                self._update_available = remote_version if remote_parts > current_parts else False
+            except ValueError:
                 self._update_available = False
-
-        except:
+        else:
             self._update_available = False
 
         return self._update_available
@@ -1757,95 +2220,173 @@ class SentinelMonitor:
         except curses.error:
             pass
 
+    # Panel-level status text. Full detail + fix command live in the
+    # diagnostics overlay; these are the one-line "why is this empty" hints.
+    _STATE_LABELS = {
+        'no_permission': 'no permission',
+        'error': 'failed',
+        'socket_missing': 'socket missing',
+        'unsupported_host': 'unsupported host',
+        'unavailable': 'disabled',
+        'not_installed': 'not installed',
+    }
+    # Actionable states are the ones a user can do something about.
+    _STATE_ORDER = {'no_permission': 0, 'error': 1, 'socket_missing': 2,
+                    'unsupported_host': 3, 'unavailable': 4, 'not_installed': 5}
+
+    def _degraded_notes(self, features):
+        """[(text, color_pair)] for every feature in `features` that is not ok.
+
+        Panels used to render nothing at all when a feature was unavailable,
+        so "you lack permission" looked identical to "there is nothing to
+        show" - the "infos don't appear" bug. Actionable states sort first and
+        are drawn in red; the diagnostics overlay carries the fix command.
+        """
+        notes = []
+        for label, key in features:
+            state = self.feature_status.get(key, {}).get('state', 'not_installed')
+            if state == 'ok':
+                continue
+            color = 4 if state in ('no_permission', 'error') else 8
+            notes.append((self._STATE_ORDER.get(state, 9),
+                          f"{label}: {self._STATE_LABELS.get(state, state)}",
+                          color))
+        notes.sort(key=lambda n: n[0])
+        return [(text, color) for _order, text, color in notes]
+
     def draw_diagnostics_modal(self, stdscr, h, w):
-        """Draw diagnostics overlay showing permission status and fixes."""
-        lines = ["╭────────── DIAGNOSTICS ──────────╮"]
-        lines.append("│  Feature        Status          │")
-        lines.append("│  ─────────────────────────────  │")
-        
-        status_map = {
-            'ok': ('✓', 2),
-            'no_perm': ('✗', 4),
-            'not_installed': ('-', 8),
-            'not_found': ('?', 8),
-        }
-        
+        """Diagnostics overlay: live view of the feature_status registry
+        (state + detail + fix hint for every degradable feature)."""
         features = [
             ('Docker', 'docker'),
             ('Kubernetes', 'kubernetes'),
             ('WireGuard', 'wireguard'),
+            ('Security Logs', 'security'),
+            ('Proxy Logs', 'proxy'),
             ('RAPL Energy', 'rapl'),
             ('Battery', 'battery'),
             ('Temperature', 'temperature'),
-            ('Security Logs', 'security'),
-            ('Proxy Logs', 'proxy'),
+            ('Wireless', 'wireless'),
+            ('Public IP', 'public_ip'),
+            ('Update Check', 'update_check'),
         ]
-        
+
+        state_map = {
+            'ok': ('✓', 2),
+            'no_permission': ('✗', 4),
+            'error': ('!', 4),
+            'not_installed': ('-', 8),
+            'unavailable': ('~', 8),
+            'socket_missing': ('○', 8),
+            'unsupported_host': ('~', 8),
+        }
+
+        # Build rows as (text, color_pair); box chrome added below
+        rows = []
         for name, key in features:
-            status = self._permissions.get(key, 'not_installed')
-            icon, color = status_map.get(status, ('?', 8))
-            status_text = status.replace('_', ' ')
-            line = f"│  {icon} {name:12} {status_text:15} │"
-            lines.append(line)
-        
-        lines.append("│                                 │")
-        # Show fix commands
-        help_text = self.get_permission_help()
-        if help_text:
-            lines.append("│  Fix commands:                  │")
-            for cmd in help_text[:3]:
-                truncated = cmd[:28]
-                lines.append(f"│  {truncated:29} │")
-        else:
-            lines.append("│  All permissions OK!            │")
-        
-        lines.append("│                                 │")
-        lines.append("╰─ Press d to close ──────────────╯")
-        
-        modal_h = len(lines)
-        modal_w = len(lines[0])
+            entry = self.feature_status.get(key, {})
+            state = entry.get('state', 'not_installed')
+            icon, color = state_map.get(state, ('?', 8))
+            rows.append((f"{icon} {name:14} {state.replace('_', ' ')}", color))
+            if state != 'ok':
+                detail = entry.get('detail') or ''
+                fix = entry.get('fix') or ''
+                if detail:
+                    rows.append((f"    {detail}", 8))
+                if fix:
+                    rows.append((f"    fix: {fix}", 3))
+
+        # A config file that failed to parse is surfaced here too, so that
+        # "my setting does nothing" has a visible cause.
+        config_error = self.config.get('_config_error')
+        if config_error:
+            rows.append(("! config file    failed to load", 4))
+            rows.append((f"    {config_error}", 8))
+            rows.append(("    fix: validate the JSON, or delete it to "
+                         "fall back to defaults", 3))
+
+        content_w = max(len(text) for text, _c in rows) if rows else 20
+        content_w = min(content_w + 2, max(20, w - 6))
+        modal_w = content_w + 2
+        modal_h = len(rows) + 4
         start_y = max(0, (h - modal_h) // 2)
         start_x = max(0, (w - modal_w) // 2)
-        
+
         try:
-            for i, line in enumerate(lines):
-                if start_y + i >= h:
+            # Top border with title
+            title = " DIAGNOSTICS "
+            stdscr.addstr(start_y, start_x, "╭" + title
+                          + "─" * max(0, modal_w - 2 - len(title)) + "╮",
+                          curses.color_pair(1))
+            # Content rows
+            for i, (text, color) in enumerate(rows):
+                row_y = start_y + 1 + i
+                if row_y >= h - 1:
                     break
-                # Truncate if line would exceed terminal width
-                if start_x + len(line) > w:
-                    line = line[:max(0, w - start_x - 1)]
-                if len(line) > 0 and start_x < w - 1:
-                    stdscr.addstr(start_y + i, start_x, line, curses.color_pair(1))
+                # Leave a column for the leading space so a full-width row
+                # cannot run over the right border.
+                text = text[:content_w - 1]
+                stdscr.addstr(row_y, start_x, "│", curses.color_pair(1))
+                stdscr.addstr(row_y, start_x + 1,
+                              " " + text + " " * max(0, content_w - len(text) - 1),
+                              curses.color_pair(color))
+                if start_x + modal_w - 1 < w:
+                    stdscr.addstr(row_y, start_x + modal_w - 1, "│",
+                                  curses.color_pair(1))
+            # Footer
+            foot_y = start_y + len(rows) + 1
+            if foot_y < h:
+                stdscr.addstr(foot_y, start_x, "│" + " " * (modal_w - 2) + "│",
+                              curses.color_pair(1))
+            if foot_y + 1 < h:
+                close = "─ Press d to close "
+                stdscr.addstr(foot_y + 1, start_x, "╰" + close
+                              + "─" * max(0, modal_w - 2 - len(close)) + "╯",
+                              curses.color_pair(1))
         except curses.error:
             pass
 
     def draw_graph(self, stdscr, y, x, width, height, data, max_val=100, title="", show_current=True):
-        """Draw a btop-style filled area graph."""
+        """Draw a btop-style filled area graph.
+
+        Batched: each row is emitted as runs of consecutive non-space cells
+        (the row color is constant), instead of one addstr per character."""
         if width <= 2 or height <= 1:
             return
-        
+
         blocks = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
         points = list(data)[-(width):]
         if not points:
             points = [0]
-        
+
         current_val = points[-1] if points else 0
         actual_max = max(max(points), max_val, 1)
-        
+
         try:
             # Draw graph area
             for row in range(height):
                 row_y = y + row
                 threshold_low = 1.0 - ((row + 1) / height)
                 threshold_high = 1.0 - (row / height)
-                
-                for col, value in enumerate(points[-width:]):
+
+                # Color based on height position (constant per row)
+                if row < height * 0.3:
+                    color = curses.color_pair(4)  # Red top
+                elif row < height * 0.6:
+                    color = curses.color_pair(3)  # Yellow mid
+                else:
+                    color = curses.color_pair(2)  # Green bottom
+
+                tail = points[-width:]
+                x_offset = x + (width - len(tail))
+                run_chars = []
+                run_x = 0
+                for col, value in enumerate(tail):
                     if col >= width:
                         break
                     normalized = min(value / actual_max, 1.0) if actual_max > 0 else 0
-                    col_x = x + col + (width - len(points[-width:]))
-                    
-                    # Determine character and color
+
+                    # Determine character
                     if normalized >= threshold_high:
                         char = "█"
                     elif normalized > threshold_low:
@@ -1853,18 +2394,18 @@ class SentinelMonitor:
                         char = blocks[int(frac * 8)]
                     else:
                         char = " "
-                    
-                    # Color based on height position (gradient effect)
-                    if row < height * 0.3:
-                        color = curses.color_pair(4)  # Red top
-                    elif row < height * 0.6:
-                        color = curses.color_pair(3)  # Yellow mid
-                    else:
-                        color = curses.color_pair(2)  # Green bottom
-                    
-                    if char != " ":
-                        stdscr.addstr(row_y, col_x, char, color)
-            
+
+                    if char == " ":
+                        if run_chars:
+                            stdscr.addstr(row_y, run_x, ''.join(run_chars), color)
+                            run_chars = []
+                        continue
+                    if not run_chars:
+                        run_x = x_offset + col
+                    run_chars.append(char)
+                if run_chars:
+                    stdscr.addstr(row_y, run_x, ''.join(run_chars), color)
+
             # Show current value
             if show_current and title:
                 val_str = f"{current_val:.1f}%" if current_val < 100 else f"{current_val:.0f}%"
@@ -1873,52 +2414,60 @@ class SentinelMonitor:
             pass
 
     def draw_mini_graph(self, stdscr, y, x, width, data, max_val=100, color=2):
-        """Draw a compact single-line sparkline."""
+        """Draw a compact single-line sparkline (single batched addstr)."""
         if not data or width <= 0:
             return
-        
+
         bars = "▁▂▃▄▅▆▇█"
         points = list(data)[-width:]
         actual_max = max(max(points), max_val, 1) if points else max_val
-        
+
+        chars = []
+        for i, value in enumerate(points):
+            if i >= width:
+                break
+            normalized = min(value / actual_max, 1.0) if actual_max > 0 else 0
+            chars.append(bars[int(normalized * 7)])
+        if not chars:
+            return
         try:
-            for i, value in enumerate(points):
-                if i >= width:
-                    break
-                normalized = min(value / actual_max, 1.0) if actual_max > 0 else 0
-                char = bars[int(normalized * 7)]
-                stdscr.addstr(y, x + i, char, curses.color_pair(color))
+            stdscr.addstr(y, x, ''.join(chars), curses.color_pair(color))
         except curses.error:
             pass
 
     def draw_braille_sparkline(self, stdscr, y, x, width, data, max_val=100, color=1):
-        """Draw high-resolution sparkline using braille characters (2x vertical resolution)."""
+        """Draw high-resolution sparkline using braille characters (2x vertical resolution).
+        Batched into a single addstr (row color is constant)."""
         if not data or width <= 0:
             return
-        
+
         # Braille patterns for 0-4 dots vertically: ⠀⡀⡄⡆⡇ (bottom to top)
         braille_base = 0x2800
         points = list(data)[-(width * 2):]  # 2 data points per character
-        
+
+        chars = []
+        for i in range(min(width, (len(points) + 1) // 2)):
+            idx = i * 2
+            v1 = points[idx] if idx < len(points) else 0
+            v2 = points[idx + 1] if idx + 1 < len(points) else 0
+
+            # Normalize to 0-3 range for braille dots
+            n1 = int(min(v1 / max_val, 1.0) * 3) if max_val > 0 else 0
+            n2 = int(min(v2 / max_val, 1.0) * 3) if max_val > 0 else 0
+
+            # Build braille character (dots 1,2,3 for left column, 4,5,6 for right)
+            char = braille_base
+            for dot in range(n1):
+                char |= (1 << dot)  # Dots 1,2,3
+            for dot in range(n2):
+                char |= (1 << (dot + 3))  # Dots 4,5,6
+            chars.append(chr(char))
+
+        if not chars:
+            return
         try:
-            for i in range(min(width, (len(points) + 1) // 2)):
-                idx = i * 2
-                v1 = points[idx] if idx < len(points) else 0
-                v2 = points[idx + 1] if idx + 1 < len(points) else 0
-                
-                # Normalize to 0-3 range for braille dots
-                n1 = int(min(v1 / max_val, 1.0) * 3) if max_val > 0 else 0
-                n2 = int(min(v2 / max_val, 1.0) * 3) if max_val > 0 else 0
-                
-                # Build braille character (dots 1,2,3 for left column, 4,5,6 for right)
-                char = braille_base
-                for dot in range(n1):
-                    char |= (1 << dot)  # Dots 1,2,3
-                for dot in range(n2):
-                    char |= (1 << (dot + 3))  # Dots 4,5,6
-                
-                stdscr.addstr(y, x + i, chr(char), curses.color_pair(color))
-        except:
+            stdscr.addstr(y, x, ''.join(chars), curses.color_pair(color))
+        except curses.error:
             pass
 
     def draw_header(self, stdscr, width, uptime_str):
@@ -1933,31 +2482,15 @@ class SentinelMonitor:
             perm_x = 16
             perm_icons = []
             # D = Docker, K = K8s, W = WireGuard, S = Security, P = Proxy, R = RAPL
-            if self._permissions.get('docker') == 'ok':
-                perm_icons.append(('D', 2))  # Green
-            elif self._permissions.get('docker') == 'no_perm':
-                perm_icons.append(('D', 4))  # Red
-            
-            if self._permissions.get('kubernetes') == 'ok':
-                perm_icons.append(('K', 2))
-            
-            if self._permissions.get('wireguard') == 'ok':
-                perm_icons.append(('W', 2))
-            elif self._permissions.get('wireguard') == 'no_perm':
-                perm_icons.append(('W', 4))
-            
-            if self._permissions.get('security') == 'ok':
-                perm_icons.append(('S', 2))
-            elif self._permissions.get('security') == 'no_perm':
-                perm_icons.append(('S', 4))
-            
-            if self._permissions.get('proxy') == 'ok':
-                perm_icons.append(('P', 2))
-            
-            if self._permissions.get('rapl') == 'ok':
-                perm_icons.append(('R', 2))
-            elif self._permissions.get('rapl') == 'no_perm':
-                perm_icons.append(('R', 4))
+            # Driven by the live feature_status registry: ok -> green,
+            # no_permission/error -> red, anything else -> hidden.
+            for char, key in (('D', 'docker'), ('K', 'kubernetes'), ('W', 'wireguard'),
+                              ('S', 'security'), ('P', 'proxy'), ('R', 'rapl')):
+                state = self.feature_status.get(key, {}).get('state', 'not_installed')
+                if state == 'ok':
+                    perm_icons.append((char, 2))  # Green
+                elif state in ('no_permission', 'error'):
+                    perm_icons.append((char, 4))  # Red
             
             for char, color in perm_icons:
                 if perm_x < width - 30:
@@ -1979,30 +2512,40 @@ class SentinelMonitor:
             pass
 
     def draw_bar(self, stdscr, y, x, width, percent, label="", show_val=True):
-        """Draw a clean gradient progress bar - btop style."""
+        """Draw a clean gradient progress bar - btop style.
+
+        Batched: the gradient has at most 4 color runs plus the empty run,
+        so the bar costs <=6 addstr calls instead of one per character."""
         if width <= 0:
             return
-        
+
         filled = int((width * min(percent, 100)) / 100)
-        
+
+        def seg_color(i):
+            pos_ratio = i / max(width - 1, 1)
+            if pos_ratio < 0.5:
+                return curses.color_pair(2)   # Green
+            if pos_ratio < 0.75:
+                return curses.color_pair(1)   # Cyan
+            if pos_ratio < 0.9:
+                return curses.color_pair(3)   # Yellow
+            return curses.color_pair(4)       # Red
+
         try:
-            # Draw filled portion with gradient
-            for i in range(filled):
-                pos_ratio = i / max(width - 1, 1)
-                if pos_ratio < 0.5:
-                    color = curses.color_pair(2)  # Green
-                elif pos_ratio < 0.75:
-                    color = curses.color_pair(1)  # Cyan  
-                elif pos_ratio < 0.9:
-                    color = curses.color_pair(3)  # Yellow
-                else:
-                    color = curses.color_pair(4)  # Red
-                stdscr.addstr(y, x + i, "━", color)
-            
-            # Draw empty portion
-            for i in range(filled, width):
-                stdscr.addstr(y, x + i, "━", curses.color_pair(8))
-            
+            # Filled portion: one addstr per same-color run
+            run_start = 0
+            while run_start < filled:
+                color = seg_color(run_start)
+                run_end = run_start + 1
+                while run_end < filled and seg_color(run_end) == color:
+                    run_end += 1
+                stdscr.addstr(y, x + run_start, "━" * (run_end - run_start), color)
+                run_start = run_end
+
+            # Empty portion: single run
+            if filled < width:
+                stdscr.addstr(y, x + filled, "━" * (width - filled), curses.color_pair(8))
+
             # Show percentage
             if show_val:
                 val_str = f"{percent:5.1f}%"
@@ -2011,37 +2554,37 @@ class SentinelMonitor:
             pass
 
     def draw_meter(self, stdscr, y, x, width, percent, label="", color=2):
-        """Draw a labeled meter bar."""
+        """Draw a labeled meter bar (batched: 2 addstr for the bar itself)."""
         if width <= 0:
             return
-        
+
         bar_width = width - len(label) - 8 if label else width - 6
         if bar_width < 4:
             bar_width = width - 2
-        
+
         try:
             if label:
                 stdscr.addstr(y, x, label, curses.color_pair(7))
                 bar_x = x + len(label) + 1
             else:
                 bar_x = x
-            
+
             filled = int((bar_width * min(percent, 100)) / 100)
-            
-            # Gradient bar
-            for i in range(bar_width):
-                if i < filled:
-                    pos_ratio = percent / 100
-                    if pos_ratio < 0.6:
-                        c = curses.color_pair(2)
-                    elif pos_ratio < 0.85:
-                        c = curses.color_pair(3)
-                    else:
-                        c = curses.color_pair(4)
-                    stdscr.addstr(y, bar_x + i, "┃", c)
-                else:
-                    stdscr.addstr(y, bar_x + i, "┃", curses.color_pair(8))
-            
+
+            # The fill color depends only on percent, so it is one run
+            pos_ratio = percent / 100
+            if pos_ratio < 0.6:
+                c = curses.color_pair(2)
+            elif pos_ratio < 0.85:
+                c = curses.color_pair(3)
+            else:
+                c = curses.color_pair(4)
+            if filled > 0:
+                stdscr.addstr(y, bar_x, "┃" * filled, c)
+            if filled < bar_width:
+                stdscr.addstr(y, bar_x + filled, "┃" * (bar_width - filled),
+                              curses.color_pair(8))
+
             # Value
             val_str = f"{percent:5.1f}%"
             stdscr.addstr(y, bar_x + bar_width + 1, val_str, curses.color_pair(7))
@@ -2103,44 +2646,104 @@ class SentinelMonitor:
         return f"{secs}s"
 
     def update_data(self):
-        """Update all system data."""
+        """Update all system data - non-blocking.
+
+        Fast synchronous reads (sub-millisecond /proc//sys file reads) run
+        inline; every slow or IO-bound feature is merged from the latest
+        background-collector snapshot. Until a collector has published its
+        first result, panels get the same placeholder shapes they used to get
+        on the first render, so the first paint is instant.
+        """
         current_time = time.time()
 
         if current_time - self.last_update < self.refresh_rate:
             return self.cache
 
-        # On first render, skip slow operations for instant UI
+        # On first render, set the public IP placeholder (fetched by collector)
         is_first = self._first_render
         if is_first:
             self._first_render = False
-            # Set public IP to checking state, will be fetched later
-            self._public_ip_cache = "Checking..."
-        
-        # Defer public IP check (slow network call)
-        if not is_first and (not hasattr(self, '_last_ip_check') or current_time - self._last_ip_check > 30):
-            self.get_public_ip()
-            self._last_ip_check = current_time
+            # In light mode there is no public_ip collector, so "Checking..."
+            # would sit there for ever.
+            self._public_ip_cache = "off" if self._light_mode else "Checking..."
 
-        # Check for updates once per day (non-blocking, silent)
-        if not is_first and current_time - self._last_update_check > self._update_check_interval:
-            self.check_for_updates()
+        # Per-stage profiling, active only when SENTINEL_PROFILE is set
+        if _PROFILE_PATH:
+            _prof_stages = {}
+            _prof_t0 = time.monotonic()
+            def _timed(name, fn):
+                _s = time.monotonic()
+                _r = fn()
+                _prof_stages[name] = round((time.monotonic() - _s) * 1000, 3)
+                return _r
+        else:
+            def _timed(name, fn):
+                return fn()
+
+        # Disk: statvfs inline + docker volumes from the docker_df collector
+        disks = _timed('disk', self.get_disk_usage)
+        docker_volumes = self._collector_result('docker_df')
+        if docker_volumes:
+            disks = disks + docker_volumes
+
+        # Slow features: latest collector snapshots (never waited on)
+        docker = self._collector_result('docker') or {
+            'available': False, 'running': 0, 'stopped': 0, 'total': 0, 'containers': []}
+        kubernetes = self._collector_result('kubernetes') or {
+            'available': False, 'nodes': 0, 'nodes_ready': 0, 'pods_running': 0,
+            'pods_pending': 0, 'pods_failed': 0, 'pods': [], 'context': ''}
+        proxy = self._collector_result('proxy') or {
+            'requests': 0, 'bytes': 0, 'rps': 0.0, 'source': None}
+        security = self._collector_result('security') or {
+            'available': False, 'total_parsed': 0, 'total_unparsed': 0,
+            'failed_logins': 0, 'successful_logins': 0, 'failed_ratio': 0.0,
+            'top_ips': {}, 'top_users': {}, 'error_types': {},
+            'recent_events': [], 'alerts': []}
 
         self.cache = {
-            'cpu': self.get_cpu_info(),
-            'mem': self.get_memory_info(),
-            'battery': self.get_battery_info(),
-            'disk': self.get_disk_usage() if not is_first else [],  # Skip docker volume check on first
-            'network': self.get_network_info(),
-            'processes': self.get_processes() if not is_first else {'total': 0, 'top_cpu': '', 'top_mem': ''},
-            'uptime': self.get_uptime(),
-            'energy': self.get_energy_info(),
-            'docker': self.get_docker_info(skip_stats=is_first),  # Skip per-container stats on first
-            'kubernetes': self.get_kubernetes_info() if not is_first else {'available': False, 'nodes': 0, 'nodes_ready': 0, 'pods_running': 0, 'pods_pending': 0, 'pods_failed': 0, 'pods': [], 'context': ''},
-            'proxy': self.get_proxy_stats() if not is_first else {'requests': 0, 'bytes': 0, 'rps': 0.0, 'source': None},
-            'security': self.get_security_logs() if not is_first else {'available': False, 'total_parsed': 0, 'total_unparsed': 0, 'failed_logins': 0, 'successful_logins': 0, 'failed_ratio': 0.0, 'top_ips': {}, 'top_users': {}, 'error_types': {}, 'recent_events': [], 'alerts': []},
+            'cpu': _timed('cpu', self.get_cpu_info),
+            'mem': _timed('mem', self.get_memory_info),
+            'battery': _timed('battery', self.get_battery_info),
+            'disk': disks,
+            'network': _timed('network', self.get_network_info),
+            'processes': _timed('processes', self.get_processes),
+            'uptime': _timed('uptime', self.get_uptime),
+            'energy': _timed('energy', self.get_energy_info),
+            'docker': docker,
+            'kubernetes': kubernetes,
+            'proxy': proxy,
+            'security': security,
         }
 
         self.last_update = current_time
+
+        if _PROFILE_PATH:
+            try:
+                _prof_collectors = {}
+                for _name, _c in self.collectors.items():
+                    _res, _err, _dur, _fin, _gen = _c.snapshot()
+                    _prof_collectors[_name] = {
+                        'duration_ms': round(_dur * 1000, 3),
+                        'age_s': round(current_time - _fin, 1) if _fin else None,
+                        'generation': _gen,
+                        'subprocesses': _c.subprocess_count,
+                        'error': str(_err) if _err else None,
+                    }
+                with open(_PROFILE_PATH, 'a') as _f:
+                    _f.write(json.dumps({
+                        'ts': current_time,
+                        'stages': _prof_stages,
+                        'collectors': _prof_collectors,
+                        'total_ms': round((time.monotonic() - _prof_t0) * 1000, 3),
+                        'run_cmd_count': _RUN_CMD_COUNT,
+                        'frames_drawn': self.frames_drawn,
+                        'frames_skipped': self.frames_skipped,
+                    }) + '\n')
+            except (OSError, TypeError, ValueError) as e:
+                # Profiling is a diagnostic side-channel; it must never take
+                # the monitor down, but it should not hide real bugs either.
+                _debug_log(f"profile write failed: {e}")
+
         return self.cache
 
     def check_alerts(self, data):
@@ -2221,10 +2824,109 @@ class SentinelMonitor:
         curses.init_pair(7, theme['text'], -1)
         curses.init_pair(8, theme['muted'], -1)
 
+    def _frame_signature(self, h, w):
+        """Cheap identity of everything the renderer reads.
+
+        Equal signature => the next full repaint would produce a byte-identical
+        screen (apart from the header clock, handled by _tick_clock), so the
+        draw can be skipped entirely.
+
+        self.last_update is the key term: update_data() only bumps it when it
+        actually re-read data, and every collector result reaches the screen
+        through that same cache, so one float covers all of them.
+        """
+        if self._no_frameskip:
+            return time.monotonic()  # never equal -> always repaint
+        return (
+            self.last_update,       # data cache generation
+            self._status_revision,  # feature/permission transitions
+            h, w,                   # terminal geometry
+            self.theme_name,
+            self.layout_mode,
+            self.refresh_rate,
+            self._show_help,
+            self._show_diagnostics,
+        )
+
+    def _tick_clock(self, stdscr, w):
+        """Partial redraw of the header clock only (the one thing that must
+        advance while the rest of the screen is unchanged).
+
+        One addstr instead of a full repaint. Suppressed while a modal is open
+        so the overlay is never punched through."""
+        if self._show_help or self._show_diagnostics:
+            return
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        if timestamp == self._last_clock:
+            return
+        self._last_clock = timestamp
+        try:
+            x = w - len(timestamp) - 1
+            if x > 0:
+                stdscr.addstr(0, x, timestamp, curses.color_pair(8))
+                stdscr.refresh()
+        except curses.error:
+            pass
+
+    def _input_timeout_ms(self):
+        """Block in getch() until the next thing that would change the screen.
+
+        getch() returns immediately on a keypress regardless of the timeout, so
+        a longer timeout costs no input latency - it only removes idle wakeups.
+        The wake target is whichever comes first: the next data refresh or the
+        next clock second."""
+        now = time.time()
+        next_data = self.last_update + self.refresh_rate
+        next_second = int(now) + 1
+        ms = int((min(next_data, next_second) - now) * 1000)
+        return max(20, min(1000, ms))
+
+    def _handle_key(self, stdscr, key):
+        """Process one key. Returns True to quit the main loop.
+
+        Shared by the full-draw and frame-skip paths. Every branch that changes
+        what is on screen also changes _frame_signature(), so the next
+        iteration repaints on its own - no explicit invalidation needed."""
+        if key == curses.KEY_RESIZE:
+            # Terminal resized - recalculate layout
+            self._cached_layout = None
+            self._last_layout_dims = (0, 0, 0, 0, '')
+        elif key == ord('q') or key == ord('Q'):
+            self.stop_collectors()
+            return True
+        elif key == ord('r') or key == ord('R'):
+            self.last_update = 0
+            self._first_render = False  # Don't skip data on manual refresh
+        elif key == ord('i') or key == ord('I'):
+            self._last_ip_check = 0
+            self.wake_collector('public_ip')
+        elif key == ord('h') or key == ord('H'):
+            self._show_help = not self._show_help
+            self._show_diagnostics = False  # Close diagnostics if help opened
+        elif key == ord('d') or key == ord('D'):
+            self._show_diagnostics = not self._show_diagnostics
+            self._show_help = False  # Close help if diagnostics opened
+        elif key == ord('t') or key == ord('T'):
+            # Cycle through themes
+            theme_list = list(THEMES.keys())
+            current_idx = theme_list.index(self.theme_name) if self.theme_name in theme_list else 0
+            self.theme_name = theme_list[(current_idx + 1) % len(theme_list)]
+            self.setup_colors()
+        elif key == ord('l') or key == ord('L'):
+            # Cycle through layouts
+            current_idx = LAYOUT_MODES.index(self.layout_mode) if self.layout_mode in LAYOUT_MODES else 0
+            self.layout_mode = LAYOUT_MODES[(current_idx + 1) % len(LAYOUT_MODES)]
+        elif key == ord('+') or key == ord('='):
+            # Decrease refresh interval (faster)
+            self.refresh_rate = max(1, self.refresh_rate - 1)
+        elif key == ord('-') or key == ord('_'):
+            # Increase refresh interval (slower)
+            self.refresh_rate = min(10, self.refresh_rate + 1)
+        return False
+
     def draw(self, stdscr):
         """Main draw function - clean btop-inspired layout."""
         curses.curs_set(0)
-        stdscr.timeout(500)
 
         # Setup theme colors
         self.setup_colors()
@@ -2232,14 +2934,29 @@ class SentinelMonitor:
         while True:
             try:
                 h, w = stdscr.getmaxyx()
-                stdscr.erase()
 
                 # Show loading modal on first render
                 if self._first_render:
+                    stdscr.erase()
                     self.draw_loading_modal(stdscr, h, w, "Initializing...")
                     stdscr.refresh()
 
                 data = self.update_data()
+
+                # P5: nothing visible changed -> skip the ~2k-addstr repaint,
+                # tick the clock, and sleep in getch() until the next change.
+                sig = self._frame_signature(h, w)
+                if sig == self._last_frame_sig:
+                    self.frames_skipped += 1
+                    self._tick_clock(stdscr, w)
+                    stdscr.timeout(self._input_timeout_ms())
+                    if self._handle_key(stdscr, stdscr.getch()):
+                        break
+                    continue
+
+                self._last_frame_sig = sig
+                self.frames_drawn += 1
+                stdscr.erase()
                 cpu = data['cpu']
                 mem = data['mem']
                 battery = data['battery']
@@ -2576,6 +3293,16 @@ class SentinelMonitor:
                             stdscr.addstr(ny + line, nx + 7, source, curses.color_pair(5))
                             stdscr.addstr(ny + line, nx + 7 + len(source) + 1, f"{rps:.1f}rps", curses.color_pair(2))
                             line += 1
+                        elif line < nh:
+                            # Proxy logs configured but unreadable: say so
+                            # instead of leaving the row silently blank.
+                            pstate = self.feature_status.get('proxy', {}).get('state', '')
+                            if pstate in ('no_permission', 'error'):
+                                label = self._STATE_LABELS.get(pstate, pstate)
+                                stdscr.addstr(ny + line, nx,
+                                              f"proxy: {label}"[:nw - 1],
+                                              curses.color_pair(4))
+                                line += 1
                         
                         # Show connection quality indicator if space
                         if line < nh and net.get('operstate') == 'up':
@@ -2831,11 +3558,33 @@ class SentinelMonitor:
 
                             # Fallback to processes if no docker/k8s/security
                             if not has_docker and not has_k8s and not has_security and line < ph:
+                                # Draw-then-advance throughout: mixing this
+                                # with look-ahead (line + 1 < ph) is what made
+                                # the notes land on top of the process line.
                                 stdscr.addstr(py + line, px, f"{proc['total']} tasks", curses.color_pair(7))
-                                if proc.get('top_cpu') and line + 1 < ph:
-                                    line += 1
+                                line += 1
+                                if proc.get('top_cpu') and line < ph:
                                     top = proc['top_cpu'][:pw - 1]
                                     stdscr.addstr(py + line, px, top, curses.color_pair(3))
+                                    line += 1
+
+                                # Say *why* docker/k8s/security are absent
+                                # instead of silently showing tasks only.
+                                notes = self._degraded_notes(
+                                    [('docker', 'docker'), ('k8s', 'kubernetes'),
+                                     ('security', 'security')])
+                                actionable = any(c == 4 for _t, c in notes)
+                                for text, color in notes:
+                                    if line >= ph:
+                                        break
+                                    stdscr.addstr(py + line, px, text[:pw - 1],
+                                                  curses.color_pair(color))
+                                    line += 1
+                                if actionable and line < ph:
+                                    stdscr.addstr(py + line, px,
+                                                  "press d to fix"[:pw - 1],
+                                                  curses.color_pair(3))
+                                    line += 1
 
                 # === FOOTER ===
                 footer_y = h - 1
@@ -2901,41 +3650,9 @@ class SentinelMonitor:
                 stdscr.refresh()
 
                 # Input handling
-                key = stdscr.getch()
-                if key == curses.KEY_RESIZE:
-                    # Terminal resized - recalculate layout
-                    self._cached_layout = None
-                    self._last_layout_dims = (0, 0, 0, 0, '')
-                    continue
-                elif key == ord('q') or key == ord('Q'):
+                stdscr.timeout(self._input_timeout_ms())
+                if self._handle_key(stdscr, stdscr.getch()):
                     break
-                elif key == ord('r') or key == ord('R'):
-                    self.last_update = 0
-                    self._first_render = False  # Don't skip data on manual refresh
-                elif key == ord('i') or key == ord('I'):
-                    self._last_ip_check = 0
-                elif key == ord('h') or key == ord('H'):
-                    self._show_help = not self._show_help
-                    self._show_diagnostics = False  # Close diagnostics if help opened
-                elif key == ord('d') or key == ord('D'):
-                    self._show_diagnostics = not self._show_diagnostics
-                    self._show_help = False  # Close help if diagnostics opened
-                elif key == ord('t') or key == ord('T'):
-                    # Cycle through themes
-                    theme_list = list(THEMES.keys())
-                    current_idx = theme_list.index(self.theme_name) if self.theme_name in theme_list else 0
-                    self.theme_name = theme_list[(current_idx + 1) % len(theme_list)]
-                    self.setup_colors()
-                elif key == ord('l') or key == ord('L'):
-                    # Cycle through layouts
-                    current_idx = LAYOUT_MODES.index(self.layout_mode) if self.layout_mode in LAYOUT_MODES else 0
-                    self.layout_mode = LAYOUT_MODES[(current_idx + 1) % len(LAYOUT_MODES)]
-                elif key == ord('+') or key == ord('='):
-                    # Decrease refresh interval (faster)
-                    self.refresh_rate = max(1, self.refresh_rate - 1)
-                elif key == ord('-') or key == ord('_'):
-                    # Increase refresh interval (slower)
-                    self.refresh_rate = min(10, self.refresh_rate + 1)
 
             except curses.error:
                 pass
@@ -3007,6 +3724,7 @@ def run_service_mode(config):
             print(f"Error: {e}")
             time.sleep(interval)
     
+    monitor.stop_collectors()
     print("\nSentinel service stopped.")
 
 
@@ -3079,6 +3797,7 @@ Config file locations (in order of priority):
     if args.service:
         run_service_mode(config)
     else:
+        monitor = None
         try:
             monitor = SentinelMonitor(config=config)
             curses.wrapper(monitor.draw)
@@ -3086,6 +3805,9 @@ Config file locations (in order of priority):
             pass
         except Exception as e:
             print(f"Error: {e}")
+        finally:
+            if monitor is not None:
+                monitor.stop_collectors()
 
 
 if __name__ == "__main__":

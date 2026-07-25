@@ -1,550 +1,463 @@
-# Sentinel Performance Optimization Guide
+# Sentinel Performance
 
-## Overview
+Sentinel targets low-end servers, Raspberry Pis and resource-constrained
+environments. This document reports what was **measured** (below), then
+documents the optimisation techniques used in the codebase.
 
-Sentinel v0.5 is designed to run efficiently on low-end servers, Raspberry Pis, and resource-constrained environments. This document details the performance optimizations implemented and best practices for deployment.
+---
 
-## Auto-Update System
+# Measured performance (v0.6.0)
 
-### Non-Intrusive Update Checker
+## How these numbers were produced — read this first
 
-Sentinel includes a smart, non-blocking update checker that:
+**No physical hardware was used.** Every number comes from CPU- and
+memory-limited Docker containers on an x86_64 host, approximating device
+classes:
 
-- ✅ Checks GitHub **once per 24 hours** (configurable)
-- ✅ Uses lightweight curl with **3-second timeout**
-- ✅ Only fetches the VERSION line (not entire file)
-- ✅ Caches result to avoid repeated API calls
-- ✅ Fails silently without bothering the user
-- ✅ Shows dimmed notification in footer when update available
+| Profile | Container limits | Approximates |
+|---------|------------------|--------------|
+| `pi3` | `--cpus=0.5 --memory=256m` | Raspberry Pi 3 |
+| `pi4` | `--cpus=1 --memory=512m` | Raspberry Pi 4 / small VPS |
 
-**How It Works:**
+These constrain CPU share and memory ceiling. They do **not** reproduce ARM
+instruction timing, slower RAM, SD-card IO latency, or thermal throttling. Real
+Pi hardware will be slower in absolute terms. The *relative* before/after
+comparison is the meaningful result; the absolute figures are not a prediction
+of Pi performance.
+
+Before and after were measured **in the same session, back to back, under the
+same host load** — results from different sessions are not comparable. 30s per
+run, first samples discarded as startup transient.
+
+Reproduce with:
 
 ```bash
-# Lightweight check (runs in background, non-blocking)
-curl -s -m 3 https://raw.githubusercontent.com/VidGuiCode/sentinel/main/sentinel-monitor.py \
-  | grep -m 1 '^VERSION = ' | cut -d'"' -f2
+DURATION=30 SENTINEL_SCRIPT=<old-revision.py> ./bench/run_profiles.sh before
+DURATION=30 ./bench/run_profiles.sh after
+python3 bench/summarize.py bench/results/after
 ```
 
-**Version Comparison:**
-- Parses semantic versioning (e.g., "0.5.0")
-- Only notifies if remote version > current version
-- Example: `0.5.1 > 0.5.0` → shows update notification
-- Example: `0.4.9 < 0.5.0` → no notification
+## v0.5.1 → v0.6.0
 
-**User Experience:**
+`Cgroup CPU%` is the share of the container's CPU quota — the figure that
+matters on a constrained device. `max` is the worst single sample, i.e. the
+spike a user would feel as a stutter.
 
+**Pi 3 profile (`--cpus=0.5 --memory=256m`)**
+
+| Tool | CPU% mean | Cgroup CPU% mean (max) | RSS MB | ctx/s (voluntary) |
+|------|-----------|------------------------|--------|-------------------|
+| v0.5.1 TUI | 0.4 | 0.9 (**12.9**) | 20.1 | 2.2 |
+| v0.6.0 TUI | 0.2 | 0.3 (**1.3**) | 31.5 | 1.7 |
+| v0.5.1 `--light` | 0.4 | 0.9 (10.0) | 20.0 | 2.2 |
+| v0.6.0 `--light` | 0.2 | 0.3 (1.1) | 21.4 | 1.5 |
+| v0.5.1 `--service` | 0.1 | 0.8 (23.3) | 19.3 | 0.8 |
+| v0.6.0 `--service` | 0.1 | 0.2 (0.9) | 31.0 | 0.5 |
+
+**Pi 4 / small VPS profile (`--cpus=1 --memory=512m`)**
+
+| Tool | CPU% mean | Cgroup CPU% mean (max) | RSS MB | ctx/s (voluntary) |
+|------|-----------|------------------------|--------|-------------------|
+| v0.5.1 TUI | 0.4 | 0.9 (12.3) | 19.8 | 2.2 |
+| v0.6.0 TUI | 0.2 | 0.3 (1.2) | 31.4 | 1.9 |
+| v0.5.1 `--light` | 0.4 | 0.8 (16.5) | 19.9 | 2.2 |
+| v0.6.0 `--light` | 0.2 | 0.3 (1.0) | 21.7 | 1.7 |
+
+### What improved
+
+- **Worst-case CPU spike: 12.9% → 1.3% of quota (Pi 3 TUI), 23.3% → 0.9%
+  headless.** This is the headline result. The old sequential fetch loop
+  bunched all its work — including subprocess spawns — into one burst on the
+  render thread; that burst *was* the UI freeze. Spreading collectors across
+  threads with their own intervals removed it.
+- **Mean CPU roughly halved** (0.9% → 0.3% of quota).
+- **Fewer wakeups**: the render loop now sleeps until the next data refresh or
+  clock second instead of waking every 500ms, and skips the repaint entirely
+  when nothing changed — about 75% of full repaints eliminated at the default
+  2s refresh.
+
+### What regressed
+
+- **RSS: 20MB → 31MB in normal mode.** Replacing the `curl` subprocess with
+  `urllib` means `urllib.request` → `ssl` → `email.parser` are imported into
+  Sentinel's own address space (~10MB) instead of living in a short-lived
+  child process. The CPU win came at a memory cost.
+- **`--light` mode does not pay this**: it no longer starts the public-IP and
+  update-check collectors, so `urllib` is never imported. **21.4MB vs 31.5MB.**
+  On a 256MB Pi 3 that is the difference between 8% and 12% of total RAM.
+  **Use `--light` on Pi-class hardware.** (Measured in isolation, without the
+  TUI's history buffers: 13.7MB light vs 23.6MB normal.)
+- Container CPU-throttle events went slightly up on the Pi 3 profile (2 → 5
+  over 30s). Work is now spread across threads, which schedules more burstily
+  against a 0.5-CPU quota even though total CPU is lower. Counts are small and
+  noisy; no user-visible effect was observed.
+
+## Comparison against btop and htop
+
+Same containers, same 30s duration, same session.
+
+**Pi 3 profile**
+
+| Tool | CPU% mean | Cgroup CPU% mean (max) | RSS MB | ctx/s (voluntary) |
+|------|-----------|------------------------|--------|-------------------|
+| sentinel v0.6.0 `--light` | 0.2 | 0.3 (1.1) | 21.4 | 1.5 |
+| sentinel v0.6.0 TUI | 0.2 | 0.3 (1.3) | 31.5 | 1.7 |
+| btop | 0.6 | 0.7 (1.4) | 5.6 | 98.9 |
+| htop | 0.1 | 0.2 (0.5) | 3.8 | 0.7 |
+
+- **CPU: Sentinel now uses less than btop** (0.3% vs 0.7% of quota) and is
+  within noise of htop.
+- **Wakeups: Sentinel is far quieter than btop** — 1.5 voluntary context
+  switches/sec vs btop's ~99/s. btop redraws on a fixed fast tick; Sentinel
+  sleeps until something changes.
+- **Memory: Sentinel is 4–6× larger.** ~14MB of that is the CPython
+  interpreter and stdlib before a line of Sentinel runs. This is the one
+  dimension where a compiled monitor wins outright, and no amount of Python
+  optimisation closes it.
+
+htop is the floor: it monitors far less (no Docker, Kubernetes, WireGuard,
+security logs, power).
+
+## Should this be rewritten?
+
+**No — the evidence does not support a Rust or Go rewrite.**
+
+The rewrite was gated on profiling showing the Python interpreter to be the
+bottleneck after optimisation. It is not:
+
+- Sentinel's CPU cost is now **below btop's**, a C++ monitor, on the same
+  workload. Interpreted execution is not the limiting factor.
+- The remaining gap is **resident memory**, and it is interpreter baseline
+  (~14MB), not interpreted execution speed. A rewrite would fix that — but it
+  would be a memory rewrite, not a performance rewrite, and it would trade a
+  single dependency-free 3.8k-line file that runs anywhere Python 3 exists for
+  a per-architecture build and release pipeline.
+- The costs that actually hurt were architectural — a blocking fetch loop,
+  subprocess spawns on the render thread, unconditional full repaints — and
+  those were fixable in place. They have been fixed.
+
+If ~21MB (light mode) is unacceptable for a target device, that is the
+argument for a rewrite. Speed is not.
+
+## ARM verification (aarch64 + armv7)
+
+**Compatibility was verified; ARM performance was not measured, and cannot be
+from this setup.**
+
+No rewrite happened, so there is nothing to cross-compile — Sentinel is a
+single pure-Python file. What needed proving is that it *runs* correctly on
+ARM: imports, `/proc` and `/sys` parsing (which differs from x86 — ARM has no
+`model name` field in `/proc/cpuinfo`), curses rendering, and both entry-point
+modes.
+
+Both architectures were smoke-tested under QEMU user-mode emulation via
+`binfmt_misc`:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install arm64,arm
+./bench/arm_smoke.sh
 ```
-Footer: quit refresh theme layout help +/- [nord][security][2s] v0.6.0 available
-                                                                 ^^^^^^^^^^^^^^^
-                                                                 (dimmed, non-intrusive)
+
+| Check | aarch64 | armv7l |
+|-------|---------|--------|
+| Runs on target architecture | ✅ | ✅ |
+| `--version` / `--help` | ✅ | ✅ |
+| `--service` emits real sampled values | ✅ | ✅ |
+| `--service --light` emits real sampled values | ✅ | ✅ |
+| TUI paints a frame | ✅ | ✅ |
+| `--light` TUI paints a frame | ✅ | ✅ |
+| Degraded features explained, not blank | ✅ | ✅ |
+
+**16 of 16 checks passed.** CPU detection resolves correctly through the ARM
+path — an aarch64 container reports `ARMv8 Processor rev 0 (v8l)`, read from
+the `Processor`/`Hardware` fields rather than x86's `model name`.
+
+**Why no ARM numbers are published:** QEMU user-mode emulation translates ARM
+instructions on an x86_64 host with a large and uneven slowdown, so any timing
+taken here would describe the emulator, not a Pi. Resident memory is equally
+unusable, since the RSS visible in the container belongs to the QEMU process
+and includes translation-cache overhead. **QEMU validates compatibility, not
+performance.** Every performance figure in this document is x86_64.
+
+Getting real ARM performance numbers requires a physical Pi. Until someone runs
+`bench/run_profiles.sh` on one, treat the relative before/after improvements as
+the transferable result — they come from removing blocking work and repaints,
+which is architecture-independent — and treat the absolute figures as x86_64
+only.
+
+## Known issues
+
+- **Benchmark flakiness on Docker Desktop for Windows.** Roughly 1 run in 6
+  under tight memory limits dies during interpreter startup with an `OSError`
+  from an import reading the bind-mounted checkout — before any Sentinel code
+  runs. It reproduces on v0.5.1 as well, so it is a host artifact, not a code
+  regression. `bench/run_profiles.sh` retries a run that yields no samples.
+- **No ARM performance data.** aarch64 and armv7 are verified to *run*
+  correctly (see above), but every performance number in this document is
+  x86_64. QEMU cannot produce meaningful ARM timings, and no physical Pi was
+  available.
+- **`bench/capture_frame.py` does not model terminal scrolling**, so its
+  captured grid can be one row off and may show remnants from earlier frames.
+  Assert on content presence, not exact positions. This affects the test tool
+  only.
+- **Temperature sensors and RAPL do not work inside WSL2, VMs or containers.**
+  This is a platform limitation — those interfaces are not exposed to the
+  guest — not a bug. Panels report it rather than showing zeros silently.
+
+---
+
+# Optimisation techniques used in the codebase
+
+## How Sentinel collects data
+
+Two tiers, split by cost:
+
+**Inline, on the render thread** — only sub-millisecond `/proc` and `/sys`
+reads: CPU, memory, disk (`os.statvfs`), network counters, uptime, battery,
+RAPL energy. These are cheap enough that threading them would cost more than
+it saves.
+
+**Background collectors** — everything slow or IO-bound runs on its own daemon
+thread at its own interval. `update_data()` merges the latest published
+snapshot and never waits. A collector that fails keeps serving its last good
+result and records the error for the diagnostics overlay.
+
+| Collector | Interval | Why |
+|-----------|----------|-----|
+| `processes` | 5s | Full `/proc` PID scan |
+| `docker` | 5s | Engine API over the unix socket |
+| `docker_df` | 30s | Volume disk usage; changes slowly |
+| `kubernetes` | 15s | `kubectl` subprocess |
+| `wireguard` | 10s | `wg show` subprocess |
+| `security` | 5s | Log tail + regex parsing |
+| `proxy` | 5s (10s light) | Log tail |
+| `probes` | 30s | Re-check permissions so fixes apply without restart |
+| `ssid` | 60s | `iwgetid` subprocess; changes only on roam |
+| `public_ip` | 300s | Network round-trip *(disabled in light mode)* |
+| `update_check` | 24h (7d light) | Network round-trip *(disabled in light mode)* |
+
+Intervals reflect how fast the data actually changes, not the refresh rate.
+Docker and Kubernetes are not polled every 2 seconds for data that changes
+every few minutes.
+
+## Techniques in use
+
+### Direct `/proc` and `/sys` reads, no subprocesses
+
+Spawning a process to read a file costs a fork, an exec and a pipe. Sentinel
+reads the file.
+
+```python
+# BAD - spawns a process
+temp = subprocess.run(['cat', '/sys/class/thermal/thermal_zone0/temp'], ...)
+
+# GOOD - direct read
+with open('/sys/class/thermal/thermal_zone0/temp') as f:
+    temp = int(f.read()) / 1000
 ```
 
-**Update Installation:**
+`shell=True` does not appear anywhere in the codebase. The single remaining
+`subprocess.run` call site takes an argv list — used only by `kubectl`,
+`wg` and `iwgetid`, all on background collectors, never on the render path.
 
-When update available, user can run:
+### Docker over the unix socket, not the CLI
+
+`docker ps`, `docker stats` and `docker system df -v` were subprocess spawns
+every cycle; the volume fallback ran `docker system df -v | grep | awk` *once
+per volume*. Sentinel now speaks HTTP to `/var/run/docker.sock` with a small
+stdlib client. `DOCKER_HOST` values that are not local unix sockets are
+reported as `unsupported_host` rather than silently ignored.
+
+### One `/proc/stat` read per cycle
+
+Aggregate CPU and per-core usage come from a single read, parsed once, instead
+of one read per core.
+
+### Process scan reads `stat` only
+
+RSS comes from field 24 of `/proc/<pid>/stat`, so `/proc/<pid>/status` — and
+its line-by-line scan — is never opened. Halves the syscalls on a scan that
+touches every PID.
+
+### Repaint only when something changed
+
+A frame signature (data generation, feature-status revision, terminal size,
+theme, layout, refresh rate, open overlay) decides whether a repaint could
+change anything. If it cannot, the ~2000-`addstr` redraw is skipped and only
+the header clock is updated. Roughly 75% of full repaints disappear at the
+default 2s refresh.
+
+`SENTINEL_NO_FRAMESKIP=1` restores unconditional repainting.
+
+### Sleep until the next change, not on a fixed tick
+
+`getch()` returns immediately on a keypress regardless of its timeout, so the
+timeout is set to whichever comes first — the next data refresh or the next
+clock second — instead of a fixed 500ms. Fewer idle wakeups, identical key
+latency.
+
+### Deferred imports
+
+`http.client` (~8MB, it pulls in `email.parser`) and `urllib.request` (~2MB)
+are imported at their call sites. A host with no Docker daemon never pays for
+the Docker client.
+
+### Pre-compiled regex
+
+Security-log patterns are compiled once at startup and reused, rather than
+re-compiled per line on every parse.
+
+### Fixed-size ring buffers
+
+All history uses `collections.deque(maxlen=N)` — 100 points normally, 50 in
+light mode. Bounded by construction, so history cannot leak.
+
+### Windowed cleanup for security events
+
+Failed-login and suspicious-IP trackers keep a 5-minute window
+(`failed_login_window`) and drop older entries, so memory stays flat on a host
+under sustained attack.
+
+## Update checker
+
+- Fetches only the first 8KB of `sentinel-monitor.py` from GitHub via
+  `urllib`, with a 3-second timeout — no `curl` subprocess.
+- Runs on a background collector: once per 24 hours, weekly in light mode.
+- Compares semantic versions and only notifies when the remote version is
+  higher.
+- Failures are recorded as `update_check: error` in the diagnostics overlay
+  rather than shown as a popup.
+- **Disabled entirely in light mode** (see below).
+- Shows a dimmed notice in the footer when an update exists.
+
+To update:
+
 ```bash
 curl -sL https://raw.githubusercontent.com/VidGuiCode/sentinel/main/install-sentinel.sh | sudo bash
 ```
 
-The installer:
-1. Detects existing installation
-2. Downloads latest sentinel-monitor.py
-3. Replaces `/usr/local/bin/sentinel`
-4. Preserves user config files
-5. Shows new features in v0.5+
+The installer preserves existing config files.
 
-## Performance Optimizations for Low-End Servers
+## Light mode
 
-### 1. Cached Data Collection
+**Recommended on Pi-class hardware** — measured at 21.4MB RSS versus 31.5MB
+normal (Pi 3 profile).
 
-**Problem:** Reading files and parsing logs on every refresh wastes CPU.
+Enabled by `--light`, by `light_mode: true` in the config, or automatically
+when `/proc/cpuinfo` looks like low-resource hardware (Raspberry Pi 4 /
+BCM2711, or a low core and RAM count).
 
-**Solution:** Time-based caching with smart intervals.
+What it changes:
 
-```python
-# Examples from codebase:
-Security logs: 5 seconds   # Balance between freshness and overhead
-Docker stats:  10 seconds  # Container data changes slowly
-Public IP:     30 seconds  # Rarely changes
-Update check:  24 hours    # Once per day is plenty
-```
-
-**Impact:**
-- Reduces filesystem I/O by ~80%
-- Lowers CPU usage from ~15% to ~3% on Raspberry Pi 3
-
-### 2. Permission-Aware Feature Detection
-
-**Problem:** Sentinel was trying to use features that the user didn't have permission for, causing wasted subprocess calls and silent failures.
-
-**Solution:** At startup, Sentinel now scans all features and detects which are available, which need permissions, and which are not installed. This avoids:
-- Running `docker` commands when the user isn't in the `docker` group
-- Running `wg show` when WireGuard permissions are missing
-- Reading `/var/log/auth.log` when the user lacks `adm` group membership
-
-**Impact:**
-- Eliminates ~3-5 wasted subprocess calls per frame
-- Reduces "permission denied" noise in logs
-- Shows the user exactly which features are active
-
-```bash
-# Header now shows: sentinel v0.5.0 D K W S P R
-# Green = working, Red = permission denied, missing = not installed
-```
-
-### 3. Light Mode Auto-Detection
-
-**Problem:** Default settings (100-point history, 2s refresh, 1000-line log tail) were too heavy for low-resource machines (e.g., Raspberry Pi, 1-vCPU VPS, 512MB-1GB RAM).
-
-**Solution:** Sentinel auto-detects low-resource hardware and switches to lighter defaults. Also supports manual `--light` flag:
-
-| Setting | Default | Light Mode |
-|---------|---------|------------|
-| Refresh rate | 2s | 3s |
-| History points | 100 | 50 |
+| Setting | Normal | Light |
+|---------|--------|-------|
+| Minimum refresh rate | 2s | 3s |
+| Graph history points | 100 | 50 |
+| Proxy log interval | 5s | 10s |
 | Security log tail | 1000 lines | 200 lines |
-| Proxy check interval | 5s | 10s |
-| Update check interval | 24h | 7 days |
+| Update check | daily | weekly |
+| Public IP collector | on | **off** |
+| Update check collector | on | **off** |
 
-**Detection:**
-```python
-# Checks /proc/cpuinfo for BCM2711 (Raspberry Pi 4) or low core/RAM counts
-# Also activated by: sentinel --light
+Disabling the two network collectors is what saves the ~10MB: they are the
+only reason `urllib` — and through it `ssl` and `email.parser` — is imported
+at all. Both report themselves as `disabled in light mode` in the diagnostics
+overlay, with the setting to change if you want them back.
+
+## Tuning for low-end hosts
+
+**1. Use light mode.** The single biggest win.
+
+```bash
+sentinel --light
 ```
 
-**Impact:**
-- ~33% reduction in RAM usage (50-point deques instead of 100)
-- ~50% reduction in log parsing overhead on low-resource machines
-- Update checks happen weekly instead of daily (less network I/O)
+**2. Slow the refresh rate.** Press `-` in the TUI (up to 10s), or set
+`refresh_rate` in the config. Fewer data refreshes means fewer repaints, since
+repaints are now driven by data changes.
 
-### 4. Merged /proc/stat Reads
+**3. Use a lighter layout.** Press `l` to cycle; `minimal` draws the fewest
+panels.
 
-**Problem:** `get_cpu_info()` and `_get_per_core_usage()` were both reading `/proc/stat` separately every frame.
-
-**Solution:** Read `/proc/stat` once per frame, cache the lines, and reuse for per-core calculations.
-
-**Impact:**
-- Eliminates one full file read per frame
-- ~0.2ms faster per frame on fast CPUs, ~0.5ms on low-resource machines
-
-### 5. Direct File Reading for Log Parsing
-
-**Problem:** Security and proxy log parsing used `tail -N` subprocess calls, which are slow on low-resource CPUs (fork overhead on ARM).
-
-**Solution:** Replace `subprocess.run(["tail", ...])` with direct Python file reading using `deque(maxlen=N)` for efficient tail reading.
-
-```python
-# Before: subprocess call every 5 seconds
-output = run_cmd("tail -1000 /var/log/auth.log 2>/dev/null")
-
-# After: direct Python read (no subprocess)
-lines = deque(maxlen=1000)
-with open('/var/log/auth.log', 'r') as f:
-    for line in f:
-        lines.append(line.rstrip('\n'))
-```
-
-**Impact:**
-- ~5-10x faster log reading on low-resource machines (no fork overhead)
-- No shell escaping issues with log paths
-
-### 6. Cached Local IP Detection
-
-**Problem:** `_get_local_ip()` was creating a socket and connecting to 8.8.8.8:80 every frame, which could hang on slow networks.
-
-**Solution:** Cache the local IP for 30 seconds and add a 1-second socket timeout.
-
-**Impact:**
-- Eliminates network calls every frame
-- Prevents UI freezing on network issues
-
-### 7. Non-Blinking Alerts
-
-**Problem:** Footer alerts used `curses.A_BLINK`, which causes curses flicker and performance issues on some terminals.
-
-**Solution:** Replaced `A_BLINK` with `A_REVERSE` (background color inversion). Same visual emphasis, no flicker.
-
-**Impact:**
-- Smoother rendering on all terminals
-- No more eye-strain from blinking text
-
-### 8. Pre-Compiled Regex Patterns
-
-**Problem:** Re-compiling regex on every log parse is expensive.
-
-**Before (v0.4):**
-```python
-for line in lines:
-    match = re.match(r'^(\w+\s+\d+...)...', line)  # Compiled EVERY iteration
-```
-
-**After (v0.5):**
-```python
-# Compile once during initialization
-self._compiled_regex = {
-    'failed_pwd': re.compile(r'^(\w+\s+\d+...)...'),
-    'success_pwd': re.compile(r'^(\w+\s+\d+...)...'),
-}
-
-# Use compiled patterns (much faster)
-for line in lines:
-    match = self._compiled_regex['failed_pwd'].match(line)
-```
-
-**Impact:**
-- **70% faster** log parsing on low-end CPUs
-- Reduces regex compilation overhead from ~20ms to ~0.1ms per check
-
-### 9. Efficient Data Structures
-
-**Deque-Based History:**
-```python
-from collections import deque
-
-# Fixed-size circular buffer (no memory leaks)
-self.cpu_history = deque([0] * 100, maxlen=100)
-self.failed_login_history = deque([0] * 100, maxlen=100)
-```
-
-**Benefits:**
-- O(1) append and discard operations
-- Automatic cleanup of old data
-- Fixed memory footprint
-- No manual garbage collection needed
-
-### 10. Direct /proc and /sys Reads
-
-**Avoid Subprocess Calls:**
-
-```python
-# BAD (spawns process, slow):
-cpu_usage = subprocess.run(['top', '-bn1'], ...)
-
-# GOOD (direct file read, fast):
-with open('/proc/stat', 'r') as f:
-    cpu_times = f.readline().split()[1:8]
-```
-
-**Results:**
-- `/proc/stat` read: **0.2ms** average
-- `top` subprocess: **15-30ms** average
-- **100x faster** CPU monitoring
-
-### 11. Lazy Loading & Startup Optimization
-
-**First Render Optimization:**
-
-```python
-is_first = self._first_render
-
-# Skip expensive operations on startup
-'docker': self.get_docker_info(skip_stats=is_first),
-'kubernetes': self.get_kubernetes_info() if not is_first else {...},
-'security': self.get_security_logs() if not is_first else {...},
-```
-
-**Impact:**
-- Initial UI appears in **<100ms** instead of 2-3 seconds
-- Shows loading modal during background data collection
-- User sees interface immediately
-
-### 12. Non-Blocking Network Calls
-
-**Public IP Check (Background):**
-```python
-# Only check every 30 seconds, non-blocking
-if current_time - self._last_ip_check > 30:
-    self.get_public_ip()  # Runs with timeout, doesn't freeze UI
-```
-
-**Update Check (Background):**
-```python
-# Only check once per day, 3-second timeout
-curl -s -m 3 https://raw.githubusercontent.com/...
-```
-
-### 13. Windowed Cleanup for Security Events
-
-**Problem:** Storing all security events forever causes memory leaks.
-
-**Solution:** Sliding window with automatic cleanup.
-
-```python
-# Keep only last 5 minutes of events
-cutoff_time = current_time - 300  # 5 minutes
-self._security_events = [e for e in self._security_events if e['timestamp'] > cutoff_time]
-
-# Cleanup old IP trackers
-for ip in list(self._ip_failure_tracker.keys()):
-    self._ip_failure_tracker[ip] = [t for t in timestamps if t > cutoff_time]
-    if not self._ip_failure_tracker[ip]:
-        del self._ip_failure_tracker[ip]
-```
-
-**Impact:**
-- Bounded memory usage (~1-2 MB for security data)
-- No memory leaks during long-running sessions
-- Efficient tracking without database overhead
-
-## Benchmark Results
-
-### Test Environment
-- **Hardware:** Raspberry Pi 3 Model B (1GB RAM, ARM Cortex-A53)
-- **OS:** Raspberry Pi OS Lite (Debian Bullseye)
-- **Workload:** Default layout, all features enabled
-
-### Resource Usage
-
-| Metric | v0.4 (baseline) | v0.5 (optimized) | Improvement |
-|--------|-----------------|------------------|-------------|
-| CPU Usage (idle) | 8-12% | 2-4% | **66% reduction** |
-| CPU Usage (active) | 15-20% | 5-8% | **60% reduction** |
-| RAM Usage | 24 MB | 18 MB | **25% reduction** |
-| Startup Time | 2.8s | 0.3s | **90% faster** |
-| Log Parse Time | 35ms | 10ms | **70% faster** |
-
-### Low-End Server Performance
-
-**Hardware:** VPS with 1 vCPU, 512MB RAM
-
-| Operation | Time (v0.4) | Time (v0.5) | Delta |
-|-----------|-------------|-------------|-------|
-| CPU info read | 0.8ms | 0.2ms | -75% |
-| Security log parse | 40ms | 12ms | -70% |
-| Docker stats | 120ms | 110ms | -8% |
-| Full UI refresh | 180ms | 135ms | -25% |
-
-## Configuration for Maximum Performance
-
-### 1. Increase Refresh Rate
-
-For very low-end systems, reduce update frequency:
+**4. Turn off the public IP lookup** if you do not need it:
 
 ```json
-{
-  "refresh_rate": 5,  // Default: 2 seconds, increase to 5-10 for slower systems
-  "public_ip_check": false  // Disable if you don't need public IP
-}
+{ "public_ip_check": false }
 ```
 
-**Runtime Adjustment:**
-```bash
-# Press - (minus) to slow down refresh rate
-# Press + (plus) to speed up
-```
-
-### 2. Use Minimal Layout
-
-The minimal layout uses less CPU for rendering:
-
-```bash
-sentinel --layout minimal
-
-# Or press 'l' repeatedly to cycle to minimal mode
-```
-
-### 3. Disable Heavy Features
-
-**If you don't use Docker/K8s:**
-```bash
-# Remove Docker socket permissions
-# Sentinel will skip Docker checks automatically (saves ~50ms per update)
-```
-
-**If you don't need security monitoring:**
-```json
-{
-  "security_logs": {}  // Empty object disables security monitoring
-}
-```
-
-### 4. Optimize Security Log Parsing
-
-**For very high-traffic servers:**
+**5. Filter large log files.** Security-log parsing cost scales with how much
+log there is to read. Pointing Sentinel at a pre-filtered file keeps the
+parser cheap:
 
 ```json
-{
-  "security_alerts": {
-    "failed_login_threshold": 50,  // Increase threshold (fewer alerts)
-    "failed_login_window": 600,    // 10-minute window instead of 5
-    "error_rate_threshold": 20     // Higher error rate before alerting
-  }
-}
+{ "security_logs": { "auth": "/var/log/auth-filtered.log" } }
 ```
 
-**Alternative:** Use grep to pre-filter logs before Sentinel reads them:
+**6. Use service mode on headless hosts.** No curses, no rendering:
 
 ```bash
-# Create filtered log (cron job every 5 minutes)
-grep -E "(Failed password|Accepted)" /var/log/auth.log > /tmp/auth-filtered.log
-
-# Point Sentinel to filtered log
-{
-  "security_logs": {
-    "auth": "/tmp/auth-filtered.log"
-  }
-}
-```
-
-## Service Mode for Headless Servers
-
-For servers without interactive terminals:
-
-```bash
-# Run in service mode (logs to syslog)
 sentinel --service
-
-# Or install systemd service
-sudo cp sentinel.service /etc/systemd/system/
-sudo systemctl enable --now sentinel
-journalctl -u sentinel -f
 ```
 
-**Service Mode Benefits:**
-- No curses UI overhead
-- Logs metrics to syslog/journal
-- Automatic restart on crash
-- Lower CPU usage (~1-2%)
+## Troubleshooting
 
-## Memory Optimization
+### A panel is empty
 
-### Deque Size Tuning
+Press `d`. The diagnostics overlay lists every degradable feature with its
+state (`ok`, `no permission`, `not installed`, `socket missing`,
+`unsupported host`, `disabled`, `error`), the detail, and the exact command to
+fix it. Panels also state their status inline.
 
-For very memory-constrained systems (< 256MB RAM):
+Permissions are re-probed every 30 seconds, so fixing one mid-session — adding
+yourself to the `docker` group, `chmod`-ing a log, starting a daemon — is
+picked up without restarting.
 
-```python
-# Edit sentinel-monitor.py (line ~209)
-# Reduce history buffer from 100 to 50 points
-self.cpu_history = deque([0] * 50, maxlen=50)  # Was: 100
-self.mem_history = deque([0] * 50, maxlen=50)
-```
-
-**Impact:**
-- Saves ~1-2 MB RAM
-- Graphs show less history (50 data points instead of 100)
-
-## Network Optimization
-
-### Disable Public IP Checks
-
-If running in closed network or don't need public IP:
-
-```json
-{
-  "public_ip_check": false
-}
-```
-
-**Savings:**
-- Avoids external API call every 30 seconds
-- Reduces network traffic
-- No timeout delays if network is slow
-
-### Adjust Update Check Interval
-
-Change from daily to weekly checks:
-
-```python
-# Edit sentinel-monitor.py (line ~246)
-self._update_check_interval = 604800  # 7 days (was: 86400 = 1 day)
-```
-
-## Disk I/O Optimization
-
-### Use tmpfs for Logs (Advanced)
-
-For very slow SD cards (Raspberry Pi):
+### High CPU
 
 ```bash
-# Mount /var/log in RAM (loses logs on reboot!)
-sudo mount -t tmpfs -o size=50M tmpfs /var/log
-
-# Or just filter logs
-sudo cp /var/log/auth.log /tmp/auth-snapshot.log
-# Point Sentinel to /tmp/auth-snapshot.log
+SENTINEL_PROFILE=/tmp/sentinel-profile.jsonl sentinel
 ```
 
-**Warning:** Only use for testing, not production!
+Writes one JSON line per data refresh: per-stage timings, per-collector
+durations and errors, subprocess counts, and frames drawn versus skipped. That
+identifies which collector is expensive rather than guessing.
 
-## Best Practices
+Common causes: a host with very many containers, or very large security logs
+(see tuning above).
 
-### ✅ Do This:
-- Use cached data (default behavior)
-- Run on Python 3.8+ for better regex performance
-- Enable sensors (`sudo sensors-detect`)
-- Use minimal layout on low-end hardware
-- Adjust refresh rate with +/- keys based on server load
-
-### ❌ Avoid This:
-- Don't set refresh_rate < 1 second (wastes CPU)
-- Don't parse massive log files (>10,000 lines)
-- Don't run multiple Sentinel instances (they compete for resources)
-- Don't disable caching (removes all optimizations)
-
-## Troubleshooting Slow Performance
-
-### High CPU Usage
+### Diagnosing feature detection
 
 ```bash
-# Check what Sentinel is doing
-strace -c -p $(pidof sentinel)
-
-# Common causes:
-# 1. Docker with many containers → Use minimal layout
-# 2. Large log files → Reduce tail lines or filter logs
-# 3. Slow disk I/O → Use SSD or tmpfs
+SENTINEL_DEBUG=1 sentinel
 ```
 
-### Slow Startup
+Logs every feature-status transition to `/tmp/sentinel-debug.log`.
+
+### Rendering artifacts
+
+If your terminal mishandles partial updates:
 
 ```bash
-# Disable features you don't use
-sentinel --service  # Service mode skips UI rendering
-
-# Or reduce initial checks
-# Edit config to disable Docker, K8s if not needed
+SENTINEL_NO_FRAMESKIP=1 sentinel
 ```
 
-### Memory Leaks
+## Comparison with other tools
 
-```bash
-# Monitor memory over time
-watch -n 1 ps aux | grep sentinel
+Measured numbers are in [Comparison against btop and
+htop](#comparison-against-btop-and-htop) above. Summary: Sentinel's CPU cost is
+now below btop's and it wakes far less often, but it uses 4–6× more resident
+memory, most of which is the CPython interpreter itself.
 
-# If growing continuously:
-# 1. Update to v0.5+ (has windowed cleanup)
-# 2. Check for custom modifications
-# 3. Report issue on GitHub
-```
+htop is the floor for resource use, and monitors far less — no Docker,
+Kubernetes, WireGuard, security logs or power.
 
-## Comparison with Other Monitoring Tools
+## Possible future work
 
-| Tool | CPU (idle) | RAM | Startup | Security Logs |
-|------|-----------|-----|---------|---------------|
-| **Sentinel v0.5** | **2-4%** | **18 MB** | **0.3s** | ✅ Built-in |
-| btop++ | 5-8% | 35 MB | 1.2s | ❌ None |
-| htop | 3-5% | 12 MB | 0.5s | ❌ None |
-| glances | 10-15% | 80 MB | 2.5s | ⚠️ Plugin |
-| netdata | 15-25% | 150 MB | 5.0s | ✅ Full suite |
-
-**Verdict:** Sentinel offers the best balance of features and performance for low-end servers.
-
-## Future Optimizations (Roadmap)
-
-- [ ] Rust-based log parser (10x faster)
-- [ ] Multi-threaded data collection
-- [ ] Binary protocol for remote monitoring
-- [ ] SQLite caching for historical data
-- [ ] GPU-accelerated rendering (for charts)
-
----
-
-**Performance Tuning Tips:**
-
-1. Start with defaults (already optimized)
-2. Monitor with `htop` while running Sentinel
-3. Adjust refresh rate based on load
-4. Disable unused features via config
-5. Report performance issues on GitHub
-
-**Goal:** Sentinel should use **<5% CPU** and **<25 MB RAM** on any Linux system from 2010+.
+- Reduce resident memory further. The remaining floor is the interpreter
+  (~14MB); beyond that only a compiled rewrite moves it, which the measured
+  data does not currently justify — see [Should this be
+  rewritten?](#should-this-be-rewritten).
+- Real ARM performance numbers from physical hardware. Compatibility is
+  verified under QEMU; performance is not measurable that way.
+- Per-panel refresh intervals exposed in the config, so users can trade
+  freshness for CPU per feature rather than globally.

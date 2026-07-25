@@ -1,11 +1,11 @@
-# Sentinel v0.5 - Universal Linux System Monitor
+# Sentinel v0.6 - Universal Linux System Monitor
 
 A lightweight terminal UI (TUI) system monitor for Linux with real-time graphs, container monitoring, security log analysis, and infrastructure-focused design. Inspired by btop. Optimized for low-power devices.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.6+-green.svg)
 ![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-0.5.0-cyan.svg)
+![Version](https://img.shields.io/badge/version-0.6.0-cyan.svg)
 
 ## Quick start
 
@@ -27,6 +27,23 @@ sentinel
 - **Processes** - Task count, top CPU/memory consumers
 - **Proxy** - Nginx/Caddy traffic monitoring (requests per second)
 - **Security** - Authentication log analysis, failed login tracking, brute force detection
+
+### v0.6 Features
+- **Non-blocking collectors** - Docker, Kubernetes, logs and network lookups run
+  on background threads with per-feature intervals; the UI never waits on them
+- **No subprocesses on the render path** - Docker Engine API over
+  `/var/run/docker.sock`, `urllib` instead of `curl`, no `shell=True` anywhere
+- **Change-driven rendering** - the screen repaints only when something actually
+  changed, and the input loop sleeps until the next change instead of ticking
+- **Self-explaining panels** - an unavailable feature says whether it is not
+  installed, permission-denied or failed; press `d` for the exact fix command
+- **Retryable permissions** - fix a permission mid-session and it is picked up
+  within 30s, no restart
+- **Leaner light mode** - skips the public-IP and update checks, saving ~10MB
+  RSS (21MB vs 31MB); recommended on Raspberry Pi
+- **Benchmark harness** (`bench/`) - measures CPU, RSS, wakeups and throttling
+  under simulated device profiles, verifies graceful degradation, and
+  smoke-tests aarch64/armv7 under QEMU
 
 ### v0.5 Features
 - **Security log monitoring** - Real-time analysis of auth.log, syslog, and secure logs
@@ -203,9 +220,18 @@ journalctl -u sentinel -f
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.6+ (standard library only — no pip packages)
 - Linux kernel 4.0+
-- Optional: lm-sensors, curl, docker, kubectl
+- Architectures: x86_64, aarch64, armv7 (ARM verified under QEMU emulation)
+- Optional, for the features that use them: `docker` (read access to
+  `/var/run/docker.sock`), `kubectl`, `wg` (WireGuard), `iwgetid` (WiFi SSID),
+  lm-sensors
+
+Anything missing or unreadable is reported in the diagnostics overlay (`d`)
+with the command to fix it — Sentinel degrades rather than failing.
+
+> On Raspberry Pi and other low-memory hosts, run with `--light`.
+> See [PERFORMANCE.md](PERFORMANCE.md) for measured numbers.
 
 ## Windows (WSL2)
 
@@ -225,6 +251,32 @@ sentinel
 - Security logs are typically empty unless `sshd` is running inside WSL2
 
 ## Changelog
+
+Full detail with rationale for each change: [CHANGELOG.md](CHANGELOG.md).
+Measured numbers: [PERFORMANCE.md](PERFORMANCE.md).
+
+### v0.6.0
+- **Non-blocking UI** - slow collectors (Docker, Kubernetes, logs, network
+  lookups) moved to background threads with per-feature intervals. Worst-case
+  CPU spike on a Pi 3 profile dropped from 12.9% to 1.3% of CPU quota.
+- **No subprocesses on the render path** - Docker CLI replaced by the Engine
+  API over `/var/run/docker.sock`, `curl` replaced by `urllib`, `shell=True`
+  removed entirely.
+- **Repaint only on change** - full-screen redraws cut by ~75% at the default
+  refresh rate, and the input loop no longer wakes every 500ms to do nothing.
+- **Panels explain themselves** - a feature that is unavailable now states
+  whether it is not installed, permission-denied, or failed, and press `d`
+  for the exact fix command. 36 bare `except:` blocks removed.
+- **Retryable permissions** - fixing a permission mid-session is picked up
+  within 30s; no restart needed.
+- **Lower memory in `--light`** - light mode skips the public-IP and update
+  checks, avoiding a ~10MB `urllib`/`ssl` import (21MB vs 31MB RSS).
+  **Recommended on Pi-class hardware.**
+- **Benchmark harness** - `bench/` measures CPU, RSS, wakeups and throttling
+  under simulated device profiles, and verifies graceful degradation.
+- **ARM verified** - aarch64 and armv7 smoke-tested under QEMU emulation
+  (16/16 checks). Compatibility only; all published performance numbers are
+  x86_64.
 
 ### v0.5.0
 - **Security log monitoring** - Real-time analysis of Linux authentication logs

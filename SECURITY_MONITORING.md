@@ -2,7 +2,7 @@
 
 ## Overview
 
-Sentinel v0.5.0 includes a comprehensive security-focused log monitoring system that analyzes Linux authentication and system logs in real-time. This feature seamlessly integrates with Sentinel's existing monitoring capabilities while maintaining the tool's performance-optimized architecture.
+Sentinel includes a comprehensive security-focused log monitoring system that analyzes Linux authentication and system logs in real-time. This feature seamlessly integrates with Sentinel's existing monitoring capabilities while maintaining the tool's performance-optimized architecture.
 
 ## Project Requirements Fulfillment
 
@@ -199,17 +199,21 @@ Footer: [BRUTE FORCE Possible brute force from 192.168.1.100 (23 attempts)]
 5. **Alert Integration**
    - Hooks into existing `check_alerts()` system
    - Compatible with all themes
-   - Footer display with blinking alerts
+   - Footer display with color-coded alerts
    - Severity-based color coding
 
 #### Performance Optimizations
 
-- **Cached reads:** Only checks logs every 5 seconds
-- **Limited parsing:** Last 100 lines per check (tail -100)
-- **Windowed cleanup:** Automatic removal of old events
+- **Background collector:** Log parsing runs on its own thread every 5
+  seconds; the render loop never waits on it (v0.6)
+- **Limited parsing:** Last 1000 lines per check (200 in light mode), read
+  directly with `deque(maxlen=N)` — no `tail` subprocess
+- **Windowed cleanup:** Automatic removal of old events, so memory stays flat
+  under sustained attack
 - **Efficient regex:** Pre-compiled patterns
-- **Non-blocking:** Doesn't slow down main UI loop
-- **Skip on first render:** Fast initial startup
+- **Degrades explicitly:** An unreadable log reports `no permission` with the
+  fix command in the diagnostics overlay (`d`) instead of showing an empty
+  panel
 
 #### Configuration
 
@@ -343,5 +347,6 @@ The feature feels native to Sentinel, as if it was always part of the design. It
 
 **Author:** Biren Gil (with Claude Code integration)
 **Date:** 2026-01-22
-**Version:** Sentinel v0.5.0
+**Version:** Introduced in Sentinel v0.5.0; collector architecture and
+explicit permission reporting added in v0.6.0
 **Project:** Linux Log Analyser & Monitoring (School Assignment)

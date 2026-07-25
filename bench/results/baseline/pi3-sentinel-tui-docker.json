@@ -1,0 +1,485 @@
+{
+  "name": "pi3-sentinel-tui-docker",
+  "duration": 30.0,
+  "exit_code": 0,
+  "samples": 57,
+  "cpu_percent": {
+    "mean": 0.63,
+    "p50": 0.0,
+    "p95": 4.0,
+    "max": 5.99
+  },
+  "cgroup_cpu_percent": {
+    "mean": 12.51,
+    "max": 48.21
+  },
+  "rss_kb": {
+    "mean": 21045.2,
+    "max": 21624
+  },
+  "ctx_switches_per_sec": {
+    "voluntary": 10.5,
+    "nonvoluntary": 0.1
+  },
+  "nr_throttled_delta": 62,
+  "throttled_usec_delta": 7633242,
+  "cgroup_total_cpu_percent": 12.78,
+  "raw_samples": [
+    {
+      "t": 1.5,
+      "cpu_percent": 2.0,
+      "cgroup_cpu_percent": 0.58,
+      "rss_kb": 20628,
+      "voluntary_ctx": 199,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 2.0,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.45,
+      "rss_kb": 20628,
+      "voluntary_ctx": 200,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 2.5,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.7,
+      "rss_kb": 20628,
+      "voluntary_ctx": 201,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 3.0,
+      "cpu_percent": 2.0,
+      "cgroup_cpu_percent": 22.08,
+      "rss_kb": 20628,
+      "voluntary_ctx": 206,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 3.5,
+      "cpu_percent": 2.0,
+      "cgroup_cpu_percent": 16.92,
+      "rss_kb": 20628,
+      "voluntary_ctx": 209,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 4.0,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.09,
+      "rss_kb": 20628,
+      "voluntary_ctx": 209,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 4.5,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 23.03,
+      "rss_kb": 20628,
+      "voluntary_ctx": 215,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 5.01,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 5.65,
+      "rss_kb": 20628,
+      "voluntary_ctx": 215,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 5.51,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 13.33,
+      "rss_kb": 20628,
+      "voluntary_ctx": 218,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 6.01,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 48.21,
+      "rss_kb": 20628,
+      "voluntary_ctx": 221,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 6.51,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 9.16,
+      "rss_kb": 20628,
+      "voluntary_ctx": 221,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 7.01,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 16.48,
+      "rss_kb": 20628,
+      "voluntary_ctx": 224,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 7.51,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 15.54,
+      "rss_kb": 20628,
+      "voluntary_ctx": 224,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 8.01,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 24.75,
+      "rss_kb": 20628,
+      "voluntary_ctx": 227,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 8.51,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 7.13,
+      "rss_kb": 20628,
+      "voluntary_ctx": 227,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 9.01,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 24.07,
+      "rss_kb": 20628,
+      "voluntary_ctx": 230,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 9.51,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 26.99,
+      "rss_kb": 20628,
+      "voluntary_ctx": 233,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 10.01,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.08,
+      "rss_kb": 20628,
+      "voluntary_ctx": 233,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 10.51,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.5,
+      "rss_kb": 20628,
+      "voluntary_ctx": 233,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 11.01,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.09,
+      "rss_kb": 20628,
+      "voluntary_ctx": 233,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 11.51,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 2.19,
+      "rss_kb": 20628,
+      "voluntary_ctx": 233,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 12.01,
+      "cpu_percent": 2.0,
+      "cgroup_cpu_percent": 5.3,
+      "rss_kb": 20628,
+      "voluntary_ctx": 237,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 12.51,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 13.34,
+      "rss_kb": 20628,
+      "voluntary_ctx": 239,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 13.01,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.07,
+      "rss_kb": 20628,
+      "voluntary_ctx": 239,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 13.51,
+      "cpu_percent": 4.0,
+      "cgroup_cpu_percent": 23.58,
+      "rss_kb": 21240,
+      "voluntary_ctx": 289,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 14.01,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 11.86,
+      "rss_kb": 21240,
+      "voluntary_ctx": 291,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 14.51,
+      "cpu_percent": 2.0,
+      "cgroup_cpu_percent": 0.74,
+      "rss_kb": 21240,
+      "voluntary_ctx": 292,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 15.01,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 13.34,
+      "rss_kb": 21240,
+      "voluntary_ctx": 294,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 15.52,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.15,
+      "rss_kb": 21240,
+      "voluntary_ctx": 294,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 16.02,
+      "cpu_percent": 3.99,
+      "cgroup_cpu_percent": 45.42,
+      "rss_kb": 21240,
+      "voluntary_ctx": 336,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 16.52,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.09,
+      "rss_kb": 21240,
+      "voluntary_ctx": 336,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 17.02,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 27.82,
+      "rss_kb": 21240,
+      "voluntary_ctx": 339,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 17.52,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 7.25,
+      "rss_kb": 21240,
+      "voluntary_ctx": 339,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 18.02,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 31.05,
+      "rss_kb": 21240,
+      "voluntary_ctx": 342,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 18.52,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.35,
+      "rss_kb": 21240,
+      "voluntary_ctx": 342,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 19.02,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 28.63,
+      "rss_kb": 21240,
+      "voluntary_ctx": 345,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 19.52,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.11,
+      "rss_kb": 21240,
+      "voluntary_ctx": 345,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 20.02,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 31.92,
+      "rss_kb": 21240,
+      "voluntary_ctx": 348,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 20.52,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.03,
+      "rss_kb": 21240,
+      "voluntary_ctx": 348,
+      "nonvoluntary_ctx": 4
+    },
+    {
+      "t": 21.02,
+      "cpu_percent": 2.0,
+      "cgroup_cpu_percent": 35.18,
+      "rss_kb": 21240,
+      "voluntary_ctx": 351,
+      "nonvoluntary_ctx": 5
+    },
+    {
+      "t": 21.52,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 19.22,
+      "rss_kb": 21240,
+      "voluntary_ctx": 354,
+      "nonvoluntary_ctx": 5
+    },
+    {
+      "t": 22.02,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.08,
+      "rss_kb": 21240,
+      "voluntary_ctx": 354,
+      "nonvoluntary_ctx": 5
+    },
+    {
+      "t": 22.52,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 1.03,
+      "rss_kb": 21240,
+      "voluntary_ctx": 354,
+      "nonvoluntary_ctx": 5
+    },
+    {
+      "t": 23.02,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 1.79,
+      "rss_kb": 21240,
+      "voluntary_ctx": 354,
+      "nonvoluntary_ctx": 5
+    },
+    {
+      "t": 23.52,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 6.69,
+      "rss_kb": 21240,
+      "voluntary_ctx": 356,
+      "nonvoluntary_ctx": 5
+    },
+    {
+      "t": 24.02,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 12.89,
+      "rss_kb": 21240,
+      "voluntary_ctx": 358,
+      "nonvoluntary_ctx": 5
+    },
+    {
+      "t": 24.52,
+      "cpu_percent": 5.99,
+      "cgroup_cpu_percent": 21.01,
+      "rss_kb": 21496,
+      "voluntary_ctx": 409,
+      "nonvoluntary_ctx": 6
+    },
+    {
+      "t": 25.02,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 15.18,
+      "rss_kb": 21496,
+      "voluntary_ctx": 413,
+      "nonvoluntary_ctx": 6
+    },
+    {
+      "t": 25.53,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.69,
+      "rss_kb": 21496,
+      "voluntary_ctx": 414,
+      "nonvoluntary_ctx": 6
+    },
+    {
+      "t": 26.03,
+      "cpu_percent": 2.0,
+      "cgroup_cpu_percent": 12.94,
+      "rss_kb": 21496,
+      "voluntary_ctx": 416,
+      "nonvoluntary_ctx": 6
+    },
+    {
+      "t": 26.53,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.11,
+      "rss_kb": 21496,
+      "voluntary_ctx": 416,
+      "nonvoluntary_ctx": 6
+    },
+    {
+      "t": 27.03,
+      "cpu_percent": 4.0,
+      "cgroup_cpu_percent": 36.06,
+      "rss_kb": 21624,
+      "voluntary_ctx": 445,
+      "nonvoluntary_ctx": 7
+    },
+    {
+      "t": 27.53,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.59,
+      "rss_kb": 21624,
+      "voluntary_ctx": 446,
+      "nonvoluntary_ctx": 7
+    },
+    {
+      "t": 28.03,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 14.42,
+      "rss_kb": 21624,
+      "voluntary_ctx": 448,
+      "nonvoluntary_ctx": 7
+    },
+    {
+      "t": 28.53,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 0.17,
+      "rss_kb": 21624,
+      "voluntary_ctx": 448,
+      "nonvoluntary_ctx": 7
+    },
+    {
+      "t": 29.03,
+      "cpu_percent": 4.0,
+      "cgroup_cpu_percent": 29.57,
+      "rss_kb": 21624,
+      "voluntary_ctx": 492,
+      "nonvoluntary_ctx": 7
+    },
+    {
+      "t": 29.53,
+      "cpu_percent": 0.0,
+      "cgroup_cpu_percent": 6.58,
+      "rss_kb": 21624,
+      "voluntary_ctx": 494,
+      "nonvoluntary_ctx": 7
+    }
+  ]
+}
