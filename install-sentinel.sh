@@ -1,10 +1,16 @@
 #!/bin/bash
-# Sentinel v0.5 - Universal Linux System Monitor
+# Sentinel - Universal Linux System Monitor
 # Multi-distro Installation Script
+#
+# Also the upgrade path: re-running this replaces /usr/local/bin/sentinel and
+# never touches your config (~/.config/sentinel/config.json).
 
 set -e
 
-VERSION="0.5.0"
+# The version is read from the binary that actually gets installed, never
+# hardcoded here -- a literal in this script silently goes stale every release
+# and then reports the wrong version at the end of a successful install.
+VERSION=""
 
 # Colors
 RED='\033[0;31m'
@@ -13,11 +19,26 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+BOX_W=47
+
+# Pad a line to the box width so the borders line up whatever the text length.
+box_line() {
+    local text="$1"
+    local len=${#text}
+    local pad=$(( BOX_W - len ))
+    [ $pad -lt 0 ] && pad=0
+    printf "║%s%*s║\n" "$text" "$pad" ""
+}
+
+installed_version() {
+    /usr/local/bin/sentinel --version 2>/dev/null | awk '{print $NF}' | tr -d 'v'
+}
+
 print_header() {
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════╗"
-    echo "║   SENTINEL v${VERSION} - System Monitor        ║"
-    echo "║   Universal Linux Installer                   ║"
+    box_line "   SENTINEL - System Monitor"
+    box_line "   Universal Linux Installer"
     echo "╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -97,6 +118,11 @@ fi
 echo -e "${GREEN}  ✓ Sensor detection complete${NC}"
 
 echo -e "${YELLOW}[3/4] Installing Sentinel...${NC}"
+# Record what was there before, so an upgrade can report old -> new.
+PREV_VERSION=""
+if [ -x /usr/local/bin/sentinel ]; then
+    PREV_VERSION=$(installed_version)
+fi
 # Try local file first, then download from GitHub
 if [ -f "$SCRIPT_DIR/sentinel-monitor.py" ]; then
     cp "$SCRIPT_DIR/sentinel-monitor.py" /usr/local/bin/sentinel
@@ -125,9 +151,16 @@ if ! grep -q "alias sentinel=" "$REAL_HOME/.bashrc" 2>/dev/null; then
 fi
 echo -e "${GREEN}  ✓ Aliases configured${NC}"
 
+VERSION=$(installed_version)
+[ -z "$VERSION" ] && VERSION="(unknown)"
+
 echo ""
 echo -e "${GREEN}╔═══════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║  ✓ Sentinel v${VERSION} installed successfully!  ║${NC}"
+if [ -n "$PREV_VERSION" ] && [ "$PREV_VERSION" != "$VERSION" ]; then
+    echo -e "${GREEN}$(box_line "  ✓ Sentinel updated: v${PREV_VERSION} -> v${VERSION}")${NC}"
+else
+    echo -e "${GREEN}$(box_line "  ✓ Sentinel v${VERSION} installed successfully")${NC}"
+fi
 echo -e "${GREEN}╚═══════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "${CYAN}Usage:${NC}"
@@ -137,25 +170,30 @@ echo ""
 echo -e "${CYAN}Controls:${NC}"
 echo "  q - Quit       r - Refresh    t - Theme"
 echo "  l - Layout     h - Help       i - Check IP"
+echo "  d - Diagnostics (why a panel is empty + how to fix)"
 echo "  +/- Adjust refresh rate (1-10s)"
 echo ""
-echo -e "${CYAN}v0.5 New Features:${NC}"
-echo "  - Security log monitoring (auth.log, syslog, secure)"
-echo "  - Failed login tracking with IP analysis"
-echo "  - Brute force detection (>20 attempts/5min)"
-echo "  - Security layout mode - press l to cycle"
-echo "  - Auto update checker (non-intrusive)"
-echo "  - Performance optimized for low-end servers"
+echo -e "${CYAN}v0.6 New Features:${NC}"
+echo "  - Non-blocking UI: slow collectors run in the background"
+echo "  - No subprocesses on the render path (Docker via socket API)"
+echo "  - Repaints only when something changed; far fewer wakeups"
+echo "  - Panels say why they are empty - press d for the fix command"
+echo "  - Permissions re-checked every 30s, no restart needed"
+echo "  - Lighter --light mode (~21MB vs ~31MB RSS)"
 echo ""
 echo -e "${CYAN}Previous Features:${NC}"
+echo "  - Security log monitoring, brute force detection"
 echo "  - 6 layout modes: default, cpu, network, docker, security, minimal"
 echo "  - Docker/K8s monitoring, proxy traffic stats"
 echo "  - Adjustable refresh rate, 5 color themes"
 echo ""
 echo -e "${CYAN}Options:${NC}"
+echo "  sentinel --light         Low-memory mode (recommended on Raspberry Pi)"
 echo "  sentinel --theme nord    Use Nord theme"
 echo "  sentinel --init-config   Create config file"
 echo "  sentinel --service       Headless mode"
+echo ""
+echo -e "${CYAN}To update later:${NC} re-run this installer (your config is kept)"
 echo ""
 echo -e "Try it now: ${GREEN}sentinel${NC}"
 echo ""

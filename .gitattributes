@@ -1,0 +1,12 @@
+# Everything in this repo runs on Linux. A file committed with CRLF endings
+# breaks at runtime, not at review time: bash fails on a CRLF shebang with
+# "$'\r': command not found", which would take out install-sentinel.sh for
+# every user, and python3 chokes the same way on a CRLF script.
+#
+# Forcing LF in the index *and* the working tree means a contributor on
+# Windows cannot accidentally publish CRLF.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gz binary
